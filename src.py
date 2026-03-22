@@ -434,24 +434,14 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
     }
 
 
-def _local_axes_from_segment(p1_2d: np.ndarray, p2_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    p1 = np.array([float(p1_2d[0]), float(p1_2d[1]), 0.0], dtype=float)
-    p2 = np.array([float(p2_2d[0]), float(p2_2d[1]), 0.0], dtype=float)
-    vx = p2 - p1
-    L = np.linalg.norm(vx)
-    if L < EPS:
-        raise ValueError('Elemento di lunghezza quasi nulla')
-    vx = vx / L
-    vy = np.array([0.0, 0.0, 1.0], dtype=float)
-    vz = np.cross(vx, vy)
-    nz = np.linalg.norm(vz)
-    if nz < EPS:
-        raise ValueError('Impossibile costruire vz')
-    vz = vz / nz
-    return p1, p2, vx, vz
-
-
 def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'combined', do_eigen: bool = True) -> Dict[str, object]:
+    """Modello 2D planare (ndm=2, ndf=3: UX, UY, RZ).
+
+    Ogni nodo ha coordinate (x, z_quota) nel piano della facciata.
+    I nodi di base (quota=0) sono incastrati (UX=UY=RZ=0).
+    Viene usato un geomTransf Linear 2D senza vettore ausiliario fuori-piano.
+    Questo approccio è numericamente molto più robusto del modello 3D vincolato.
+    """
     try:
         import openseespy.opensees as ops
     except Exception as exc:
@@ -466,44 +456,40 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     exo = shs_properties(params.exo_b, params.exo_t, params.steel_G)
 
     ops.wipe()
-    ops.model('basic', '-ndm', 3, '-ndf', 6)
+    ops.model('basic', '-ndm', 2, '-ndf', 3)
 
     for tag, (x, z) in enumerate(face_nodes, start=1):
-        ops.node(tag, float(x), float(z), 0.0)
+        ops.node(tag, float(x), float(z))
 
     base_node_tags = []
-    constrained_planar_tags = []
     for tag, (_, z) in enumerate(face_nodes, start=1):
         if abs(float(z)) < 1e-8:
-            ops.fix(tag, 1, 1, 1, 1, 1, 1)
+            ops.fix(tag, 1, 1, 1)
             base_node_tags.append(tag)
-        else:
-            # Telaio 3D planare nel piano XY: liberi UX, UY, RZ; vincolati UZ, RX, RY
-            ops.fix(tag, 0, 0, 1, 1, 1, 0)
-            constrained_planar_tags.append(tag)
 
-    ele_pairs = []
-    ele_lengths = []
-    elem_local_axes = []
+    ele_pairs: List[Tuple[int, int]] = []
+    ele_lengths: List[float] = []
+    elem_local_axes: List[Dict] = []
     ele_tag = 1
     transf_tag = 1
     for i, j in face_edges:
         ni = int(i) + 1
         nj = int(j) + 1
-        p1_2d = face_nodes[int(i)]
-        p2_2d = face_nodes[int(j)]
-        try:
-            p1_3d, p2_3d, vx, vecxz = _local_axes_from_segment(p1_2d, p2_2d)
-        except Exception:
-            continue
-        L = float(np.linalg.norm(p2_3d - p1_3d))
+        p1 = face_nodes[int(i)]
+        p2 = face_nodes[int(j)]
+        L = float(np.linalg.norm(p2 - p1))
         if L < params.min_edge_len * 0.5:
             continue
-        ops.geomTransf('Linear', transf_tag, float(vecxz[0]), float(vecxz[1]), float(vecxz[2]))
-        ops.element('elasticBeamColumn', ele_tag, ni, nj, exo['A'], params.steel_E, params.steel_G, exo['J'], exo['Iy'], exo['Iz'], transf_tag, '-mass', exo['A'] * params.steel_rho)
+        ops.geomTransf('Linear', transf_tag)
+        ops.element(
+            'elasticBeamColumn', ele_tag, ni, nj,
+            exo['A'], params.steel_E, exo['Iz'], transf_tag,
+            '-mass', exo['A'] * params.steel_rho,
+        )
         ele_pairs.append((ni, nj))
         ele_lengths.append(L)
-        elem_local_axes.append({'vx': vx.tolist(), 'vy': [0.0, 0.0, 1.0], 'vz': vecxz.tolist()})
+        vx = (p2 - p1) / L
+        elem_local_axes.append({'vx': vx.tolist()})
         ele_tag += 1
         transf_tag += 1
 
@@ -520,7 +506,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         mx = floor_mass / len(story_nodes)
         my = mx if params.include_vertical_mass else 1e-9
         for tag in story_nodes:
-            ops.mass(tag, mx, my, 1e-9, 1e-9, 1e-9, 1e-9)
+            ops.mass(tag, mx, my, 1e-9)
 
     ops.timeSeries('Linear', 1)
     ops.pattern('Plain', 1, 1)
@@ -531,11 +517,11 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         if load_case in ('lateral', 'combined'):
             px = wind_story_face / len(story_nodes)
             for tag in story_nodes:
-                ops.load(tag, px, 0.0, 0.0, 0.0, 0.0, 0.0)
+                ops.load(tag, px, 0.0, 0.0)
         if load_case in ('gravity', 'combined'):
             py = -g_floor / len(story_nodes)
             for tag in story_nodes:
-                ops.load(tag, 0.0, py, 0.0, 0.0, 0.0, 0.0)
+                ops.load(tag, 0.0, py, 0.0)
 
     ops.constraints('Transformation')
     ops.numberer('RCM')
@@ -546,31 +532,33 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     ops.analysis('Static')
     ok = ops.analyze(1)
 
-    node_disp = np.zeros((len(face_nodes), 6), dtype=float)
+    # Displacements: 3 DOF per node (UX, UY, RZ)
+    node_disp = np.zeros((len(face_nodes), 3), dtype=float)
     for i in range(len(face_nodes)):
         try:
             node_disp[i, :] = np.asarray(ops.nodeDisp(i + 1), dtype=float)
         except Exception:
             node_disp[i, :] = 0.0
 
+    # Element forces: 6 DOF per element (N, V, M at i-end + j-end)
     elem_forces = []
     elem_quantities = []
     for etag in range(1, len(ele_pairs) + 1):
         try:
             f = np.asarray(ops.eleResponse(etag, 'force'), dtype=float)
         except Exception:
-            f = np.zeros(12, dtype=float)
+            f = np.zeros(6, dtype=float)
         elem_forces.append(f)
-        if len(f) >= 12:
-            N = max(abs(float(f[0])), abs(float(f[6])))
-            V = max(abs(float(f[1])), abs(float(f[7])))
-            M = max(abs(float(f[5])), abs(float(f[11])))
+        if len(f) >= 6:
+            N = max(abs(float(f[0])), abs(float(f[3])))
+            V = max(abs(float(f[1])), abs(float(f[4])))
+            M = max(abs(float(f[2])), abs(float(f[5])))
         else:
             N = V = M = 0.0
         elem_quantities.append({'N': N, 'V': V, 'M': M})
 
-    eig_vals = []
-    periods = []
+    eig_vals: List[float] = []
+    periods: List[float] = []
     if do_eigen:
         try:
             eig_vals = list(ops.eigen(params.n_eigen))
@@ -582,13 +570,29 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     ux = node_disp[:, 0]
     uz = node_disp[:, 1]
     umag = np.sqrt(ux ** 2 + uz ** 2)
+
+    # Inter-story drift ratio (per piano)
+    story_ux: Dict[int, float] = {}
+    for k in range(len(z_levels)):
+        idxs = [int(i) for i in floor_nodes.get(k, [])]
+        if idxs:
+            story_ux[k] = float(np.mean(ux[idxs]))
+    drift_ratios: List[float] = []
+    for k in range(1, len(z_levels)):
+        if k in story_ux and k - 1 in story_ux:
+            h = float(z_levels[k] - z_levels[k - 1])
+            d = abs(story_ux[k] - story_ux[k - 1])
+            if h > EPS:
+                drift_ratios.append(d / h)
+    max_drift = float(max(drift_ratios)) if drift_ratios else 0.0
+
     return {
         'analysis_ok': int(ok) == 0,
         'load_case': load_case,
         'nodes': face_nodes,
         'edges': np.asarray(ele_pairs, dtype=int) - 1,
         'base_node_tags': base_node_tags,
-        'constrained_planar_tags': constrained_planar_tags,
+        'constrained_planar_tags': [],
         'node_disp': node_disp,
         'ux': ux,
         'uz': uz,
@@ -601,6 +605,8 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         'periods_s': periods,
         'top_ux': float(np.nanmax(np.abs(ux))) if len(ux) else 0.0,
         'top_umag': float(np.nanmax(np.abs(umag))) if len(umag) else 0.0,
+        'max_drift_ratio': max_drift,
+        'story_ux': story_ux,
     }
 
 
@@ -738,6 +744,38 @@ def plotly_face_displacement_map(face_result: Dict[str, object], component: str 
     fig.add_trace(go.Scatter(x=x_lines, y=z_lines, mode='lines', name='Mesh', line=dict(color='rgba(90,90,90,0.30)', width=1.2)))
     fig.add_trace(go.Scatter(x=nodes[:, 0], y=nodes[:, 1], mode='markers', name=component, marker=dict(size=6, color=vals, colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title=component)), customdata=np.column_stack([face_result['ux'], face_result['uz'], face_result['umag']]), hovertemplate='x=%{x:.2f} m<br>z=%{y:.2f} m<br>ux=%{customdata[0]:.4e} m<br>uz=%{customdata[1]:.4e} m<br>|u|=%{customdata[2]:.4e} m<extra></extra>'))
     fig.update_layout(title=f'Facciata 2D – mappa spostamenti nodali ({component})', xaxis_title='Sviluppo facciata [m]', yaxis_title='Quota z [m]', yaxis_scaleanchor='x', template='plotly_white', height=760)
+    return fig
+
+
+def plotly_face_drift_profile(face_result: Dict[str, object], n_stories: int, story_height: float):
+    """Profilo degli spostamenti medi di piano e del drift inter-piano."""
+    import plotly.graph_objects as go
+    story_ux = face_result.get('story_ux', {})
+    if not story_ux:
+        return go.Figure()
+    levels = sorted(story_ux.keys())
+    z_vals = [k * story_height for k in levels]
+    ux_vals = [story_ux[k] for k in levels]
+    drift_vals = []
+    drift_z = []
+    for k in range(1, len(levels)):
+        h = story_height
+        d = abs(ux_vals[k] - ux_vals[k - 1])
+        drift_vals.append(d / h if h > EPS else 0.0)
+        drift_z.append((z_vals[k] + z_vals[k - 1]) / 2.0)
+
+    from plotly.subplots import make_subplots
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True,
+                        subplot_titles=['Spostamento medio di piano [m]', 'Drift inter-piano [−]'])
+    fig.add_trace(go.Scatter(x=ux_vals, y=z_vals, mode='lines+markers', name='ux medio',
+                             line=dict(color='#0a84ff', width=2), marker=dict(size=4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=drift_vals, y=drift_z, mode='lines+markers', name='drift',
+                             line=dict(color='#ff3b30', width=2), marker=dict(size=4)), row=1, col=2)
+    # Limite H/500
+    limit = story_height / 500.0
+    fig.add_vline(x=limit, line_dash='dot', line_color='orange', annotation_text='H/500', row=1, col=2)
+    fig.update_layout(title='Profilo spostamenti e drift inter-piano', template='plotly_white', height=600)
+    fig.update_yaxes(title_text='Quota z [m]', row=1, col=1)
     return fig
 
 
