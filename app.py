@@ -175,8 +175,11 @@ with tab2:
                   delta_color="normal" if top_ux <= h_limit else "inverse")
 
         st.caption(
-            f"Modello 2D (ndm=2, ndf=3): {len(face_analysis.get('base_node_tags', []))} nodi "
-            f"di base incastrati; {len(face_analysis.get('edges', []))} elementi elastici."
+            f"Modello 2D (ndm=2, ndf=3): "
+            f"{face_analysis.get('n_active_nodes', len(face_analysis.get('base_node_tags', [])))} nodi attivi "
+            f"({len(face_analysis.get('base_node_tags', []))} incastrati alla base); "
+            f"{face_analysis.get('n_active_elements', len(face_analysis.get('edges', [])))} elementi elastici. "
+            f"Nodi geometria totale: {len(face['face_nodes'])}."
         )
 
         copt1, copt2, copt3 = st.columns(3)

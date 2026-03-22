@@ -437,10 +437,12 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
 def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'combined', do_eigen: bool = True) -> Dict[str, object]:
     """Modello 2D planare (ndm=2, ndf=3: UX, UY, RZ).
 
-    Ogni nodo ha coordinate (x, z_quota) nel piano della facciata.
-    I nodi di base (quota=0) sono incastrati (UX=UY=RZ=0).
-    Viene usato un geomTransf Linear 2D senza vettore ausiliario fuori-piano.
-    Questo approccio è numericamente molto più robusto del modello 3D vincolato.
+    Strategia anti-singolarità a tre livelli:
+    1. Pre-filtraggio degli elementi per lunghezza minima.
+    2. Ri-pruning BFS: si tengono solo i nodi raggiungibili dalla base
+       attraverso gli elementi filtrati (evita sottocomponenti flottanti).
+    3. Solo i nodi che compaiono in almeno un elemento valido vengono
+       inseriti nel modello OpenSees (evita DOF orfani).
     """
     try:
         import openseespy.opensees as ops
@@ -455,43 +457,44 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     floor_nodes = face.get('floor_nodes') or collect_floor_node_indices(face_nodes, z_levels, tol=1e-6)
     exo = shs_properties(params.exo_b, params.exo_t, params.steel_G)
 
-    ops.wipe()
-    ops.model('basic', '-ndm', 2, '-ndf', 3)
+    # ── 1. Pre-filtraggio per lunghezza ─────────────────────────────────────
+    L_min = params.min_edge_len * 0.5
+    candidate: List[Tuple[int, int, float]] = []  # (face_i, face_j, L)
+    for raw_i, raw_j in face_edges:
+        fi, fj = int(raw_i), int(raw_j)
+        L = float(np.linalg.norm(face_nodes[fi] - face_nodes[fj]))
+        if L >= L_min:
+            candidate.append((fi, fj, L))
 
-    for tag, (x, z) in enumerate(face_nodes, start=1):
-        ops.node(tag, float(x), float(z))
+    # ── 2. Ri-pruning BFS dalla base attraverso gli elementi filtrati ────────
+    base_face_idxs = {i for i, (_, z) in enumerate(face_nodes) if abs(float(z)) < 1e-8}
+    adj_cand: Dict[int, List[int]] = defaultdict(list)
+    for fi, fj, _ in candidate:
+        adj_cand[fi].append(fj)
+        adj_cand[fj].append(fi)
 
-    base_node_tags = []
-    for tag, (_, z) in enumerate(face_nodes, start=1):
-        if abs(float(z)) < 1e-8:
-            ops.fix(tag, 1, 1, 1)
-            base_node_tags.append(tag)
+    visited: set = set(base_face_idxs)
+    queue: deque = deque(base_face_idxs)
+    while queue:
+        u = queue.popleft()
+        for v in adj_cand[u]:
+            if v not in visited:
+                visited.add(v)
+                queue.append(v)
 
-    ele_pairs: List[Tuple[int, int]] = []
-    ele_lengths: List[float] = []
-    elem_local_axes: List[Dict] = []
-    ele_tag = 1
-    transf_tag = 1
-    for i, j in face_edges:
-        ni = int(i) + 1
-        nj = int(j) + 1
-        p1 = face_nodes[int(i)]
-        p2 = face_nodes[int(j)]
-        L = float(np.linalg.norm(p2 - p1))
-        if L < params.min_edge_len * 0.5:
-            continue
-        ops.geomTransf('Linear', transf_tag)
-        ops.element(
-            'elasticBeamColumn', ele_tag, ni, nj,
-            exo['A'], params.steel_E, exo['Iz'], transf_tag,
-            '-mass', exo['A'] * params.steel_rho,
-        )
-        ele_pairs.append((ni, nj))
-        ele_lengths.append(L)
-        vx = (p2 - p1) / L
-        elem_local_axes.append({'vx': vx.tolist()})
-        ele_tag += 1
-        transf_tag += 1
+    valid: List[Tuple[int, int, float]] = [
+        (fi, fj, L) for fi, fj, L in candidate if fi in visited and fj in visited
+    ]
+    if not valid:
+        return {'analysis_ok': False, 'error': 'Nessun elemento valido dopo il filtraggio. Riduci la lunghezza minima delle aste.'}
+
+    # ── 3. Mappa face_idx → ops_tag (1-based) ───────────────────────────────
+    used_face: set = set()
+    for fi, fj, _ in valid:
+        used_face.add(fi)
+        used_face.add(fj)
+    face_to_ops: Dict[int, int] = {fi: tag for tag, fi in enumerate(sorted(used_face), start=1)}
+    ops_to_face: Dict[int, int] = {v: k for k, v in face_to_ops.items()}
 
     floor_area_face = max((params.plan_size ** 2 - params.core_size ** 2) / 4.0, 1.0)
     g_floor = params.floor_dead_kN_m2 * 1e3 * floor_area_face
@@ -499,30 +502,65 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     floor_mass = (g_floor + 0.3 * q_floor) / 9.81
     wind_story_face = 0.5 * params.wind_line_kN_m * 1e3 * params.story_height
 
+    # ── Costruzione modello OpenSees ─────────────────────────────────────────
+    ops.wipe()
+    ops.model('basic', '-ndm', 2, '-ndf', 3)
+
+    for fi, ops_tag in face_to_ops.items():
+        x, z = face_nodes[fi]
+        ops.node(ops_tag, float(x), float(z))
+
+    base_node_tags: List[int] = []
+    for fi, ops_tag in face_to_ops.items():
+        _, z = face_nodes[fi]
+        if abs(float(z)) < 1e-8:
+            ops.fix(ops_tag, 1, 1, 1)
+            base_node_tags.append(ops_tag)
+
+    ele_pairs_ops: List[Tuple[int, int]] = []
+    ele_lengths: List[float] = []
+    elem_local_axes: List[Dict] = []
+    for ele_tag, (fi, fj, L) in enumerate(valid, start=1):
+        ni = face_to_ops[fi]
+        nj = face_to_ops[fj]
+        ops.geomTransf('Linear', ele_tag)
+        ops.element(
+            'elasticBeamColumn', ele_tag, ni, nj,
+            exo['A'], params.steel_E, exo['Iz'], ele_tag,
+            '-mass', exo['A'] * params.steel_rho,
+        )
+        ele_pairs_ops.append((ni, nj))
+        ele_lengths.append(L)
+        vx = (face_nodes[fj] - face_nodes[fi]) / L
+        elem_local_axes.append({'vx': vx.tolist()})
+
+    # ── Masse nodali ─────────────────────────────────────────────────────────
     for k in range(1, len(z_levels)):
-        story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
-        if not story_nodes:
+        sn = [face_to_ops[int(i)] for i in floor_nodes.get(k, []) if int(i) in face_to_ops]
+        if not sn:
             continue
-        mx = floor_mass / len(story_nodes)
+        mx = floor_mass / len(sn)
         my = mx if params.include_vertical_mass else 1e-9
-        for tag in story_nodes:
+        for tag in sn:
             ops.mass(tag, mx, my, 1e-9)
 
+    # ── Carichi ──────────────────────────────────────────────────────────────
     ops.timeSeries('Linear', 1)
     ops.pattern('Plain', 1, 1)
     for k in range(1, len(z_levels)):
-        story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
-        if not story_nodes:
+        sn = [face_to_ops[int(i)] for i in floor_nodes.get(k, []) if int(i) in face_to_ops]
+        if not sn:
             continue
         if load_case in ('lateral', 'combined'):
-            px = wind_story_face / len(story_nodes)
-            for tag in story_nodes:
+            px = wind_story_face / len(sn)
+            for tag in sn:
                 ops.load(tag, px, 0.0, 0.0)
         if load_case in ('gravity', 'combined'):
-            py = -g_floor / len(story_nodes)
-            for tag in story_nodes:
+            py = -g_floor / len(sn)
+            for tag in sn:
                 ops.load(tag, 0.0, py, 0.0)
 
+    # ── Analisi statica ──────────────────────────────────────────────────────
     ops.constraints('Transformation')
     ops.numberer('RCM')
     ops.system('BandGeneral')
@@ -532,18 +570,18 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     ops.analysis('Static')
     ok = ops.analyze(1)
 
-    # Displacements: 3 DOF per node (UX, UY, RZ)
+    # ── Spostamenti nodali (3 DOF) ───────────────────────────────────────────
     node_disp = np.zeros((len(face_nodes), 3), dtype=float)
-    for i in range(len(face_nodes)):
+    for fi, ops_tag in face_to_ops.items():
         try:
-            node_disp[i, :] = np.asarray(ops.nodeDisp(i + 1), dtype=float)
+            node_disp[fi, :] = np.asarray(ops.nodeDisp(ops_tag), dtype=float)
         except Exception:
-            node_disp[i, :] = 0.0
+            pass
 
-    # Element forces: 6 DOF per element (N, V, M at i-end + j-end)
-    elem_forces = []
-    elem_quantities = []
-    for etag in range(1, len(ele_pairs) + 1):
+    # ── Forze di elemento (6 valori: N,V,M × 2 estremità) ───────────────────
+    elem_forces: List[np.ndarray] = []
+    elem_quantities: List[Dict] = []
+    for etag in range(1, len(valid) + 1):
         try:
             f = np.asarray(ops.eleResponse(etag, 'force'), dtype=float)
         except Exception:
@@ -557,6 +595,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
             N = V = M = 0.0
         elem_quantities.append({'N': N, 'V': V, 'M': M})
 
+    # ── Analisi modale ───────────────────────────────────────────────────────
     eig_vals: List[float] = []
     periods: List[float] = []
     if do_eigen:
@@ -571,10 +610,10 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     uz = node_disp[:, 1]
     umag = np.sqrt(ux ** 2 + uz ** 2)
 
-    # Inter-story drift ratio (per piano)
+    # ── Drift inter-piano ────────────────────────────────────────────────────
     story_ux: Dict[int, float] = {}
     for k in range(len(z_levels)):
-        idxs = [int(i) for i in floor_nodes.get(k, [])]
+        idxs = [int(i) for i in floor_nodes.get(k, []) if int(i) in face_to_ops]
         if idxs:
             story_ux[k] = float(np.mean(ux[idxs]))
     drift_ratios: List[float] = []
@@ -586,11 +625,16 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
                 drift_ratios.append(d / h)
     max_drift = float(max(drift_ratios)) if drift_ratios else 0.0
 
+    # Converti ele_pairs da ops-tag a face-idx (0-based) per il plotting
+    result_edges = np.array(
+        [(ops_to_face[ni], ops_to_face[nj]) for ni, nj in ele_pairs_ops], dtype=int
+    )
+
     return {
         'analysis_ok': int(ok) == 0,
         'load_case': load_case,
         'nodes': face_nodes,
-        'edges': np.asarray(ele_pairs, dtype=int) - 1,
+        'edges': result_edges,
         'base_node_tags': base_node_tags,
         'constrained_planar_tags': [],
         'node_disp': node_disp,
@@ -607,6 +651,8 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         'top_umag': float(np.nanmax(np.abs(umag))) if len(umag) else 0.0,
         'max_drift_ratio': max_drift,
         'story_ux': story_ux,
+        'n_active_nodes': len(used_face),
+        'n_active_elements': len(valid),
     }
 
 
