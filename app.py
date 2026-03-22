@@ -122,6 +122,14 @@ c2.metric("Aste facciata", len(face['face_edges']))
 c3.metric("Seed Voronoi", len(face['seeds']))
 c4.metric("Livelli", len(face['floor_nodes']))
 
+prune = face.get('prune_stats', {})
+if prune:
+    st.info(
+        f"Connessioni pulite prima dell'analisi: componenti trovati={prune.get('components_total', 0)}, "
+        f"componenti tenuti={prune.get('components_kept', 0)}, nodi rimossi={prune.get('nodes_removed', 0)}, "
+        f"aste rimosse={prune.get('edges_removed', 0)}."
+    )
+
 tab1, tab2, tab3, tab4 = st.tabs(["Facciata 2D", "Analisi 2D", "Costruzione 3D", "Esporta"])
 
 with tab1:
@@ -138,6 +146,11 @@ with tab2:
         cc2.metric("Ux max [m]", f"{face_analysis.get('top_ux', 0.0):.4e}")
         cc3.metric("|u| max [m]", f"{face_analysis.get('top_umag', 0.0):.4e}")
         cc4.metric("Aste analizzate", len(face_analysis.get('edges', [])))
+
+        st.caption(
+            f"Vincoli applicati: {len(face_analysis.get('base_node_tags', []))} nodi di base completamente fissati; "
+            f"{len(face_analysis.get('constrained_planar_tags', []))} nodi non di base con UZ=RX=RY vincolati (modello 3D planare)."
+        )
 
         copt1, copt2, copt3 = st.columns([1, 1, 1])
         disp_component = copt1.selectbox("Mappa spostamenti nodali", ["ux", "uz", "umag"], index=0)

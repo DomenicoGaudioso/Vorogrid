@@ -4,13 +4,13 @@ Pipeline focalizzata su:
 1) generazione e analisi FEM della sola facciata 2D Voronoi;
 2) costruzione del modello geometrico 3D a partire dalla facciata 2D.
 
-In questa versione NON viene eseguita l'analisi FEM 3D.
-La facciata è analizzata con beam 3D planari, così ogni elemento riceve una
-trasformazione locale esplicita derivata dai versori:
-    vx = lungo asta
-    vy = (0,0,1)
-    vz = vx x vy
-con vecxz = vz passato a geomTransf('Linear', ...).
+Correzioni di stabilità applicate:
+- pruning dei componenti scollegati dalla base;
+- rimozione di nodi orfani (non appartenenti ad alcuna asta);
+- modello OpenSees eseguito come telaio 3D planare, ma con vincoli ai gradi di libertà
+  fuori piano: per tutti i nodi non di base si impone UZ=0, RX=0, RY=0; restano liberi UX, UY, RZ.
+
+Questo evita i modi di corpo rigido fuori piano che rendono la matrice singolare.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, Iterable, List, Tuple, Optional
 import math
 import json
+from collections import defaultdict, deque
 
 import numpy as np
 from scipy.spatial import Voronoi
@@ -39,16 +40,14 @@ class TowerParams:
     belt_strength: float = 2.0
     corner_strength: float = 1.8
     base_strength: float = 2.5
-    mode: str = "adaptive"   # adaptive | random | megaframe | belts
+    mode: str = "adaptive"
 
-    # materiale / sezione esoscheletro
     steel_E: float = 210e9
     steel_G: float = 81e9
     steel_rho: float = 7850.0
     exo_b: float = 1.10
     exo_t: float = 0.09
 
-    # carichi per facciata 2D
     floor_dead_kN_m2: float = 7.0
     floor_live_kN_m2: float = 3.0
     wind_line_kN_m: float = 200.0
@@ -193,7 +192,6 @@ def sample_variable_density_seeds(width: float, height: float, params: TowerPara
     p = w / w.sum()
     idx = rng.choice(np.arange(pool_n), size=params.n_seeds, replace=False, p=p)
     seeds = np.column_stack([x[idx], z[idx]])
-
     anchors = []
     n_edge = max(10, params.n_seeds // 25)
     zs = np.linspace(0.0, height, n_edge)
@@ -269,6 +267,70 @@ def collect_floor_node_indices(nodes: np.ndarray, z_levels: np.ndarray, tol: flo
     return out
 
 
+def prune_face_graph_to_base(nodes: np.ndarray, edges: np.ndarray, z_levels: np.ndarray, tol: float = 1e-6):
+    """Mantiene solo i componenti connessi che contengono almeno un nodo di base.
+    Rimuove anche nodi orfani (non incidenti ad alcuna asta).
+    """
+    n = len(nodes)
+    if n == 0:
+        return nodes, edges, {'components_total': 0, 'components_kept': 0, 'nodes_removed': 0, 'edges_removed': 0}
+
+    adj = defaultdict(set)
+    used_nodes = set()
+    for i, j in edges:
+        i = int(i); j = int(j)
+        adj[i].add(j)
+        adj[j].add(i)
+        used_nodes.add(i)
+        used_nodes.add(j)
+
+    base_nodes = {i for i, p in enumerate(nodes) if abs(float(p[1]) - float(z_levels[0])) <= tol}
+    visited = set()
+    keep_nodes = set()
+    components_total = 0
+    components_kept = 0
+
+    for start in sorted(used_nodes):
+        if start in visited:
+            continue
+        components_total += 1
+        q = deque([start])
+        comp = set([start])
+        visited.add(start)
+        touches_base = start in base_nodes
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in visited:
+                    visited.add(v)
+                    comp.add(v)
+                    q.append(v)
+                    if v in base_nodes:
+                        touches_base = True
+        if touches_base:
+            components_kept += 1
+            keep_nodes |= comp
+
+    # rimappa indici
+    keep_nodes = sorted(keep_nodes)
+    mapping = {old: new for new, old in enumerate(keep_nodes)}
+    new_nodes = np.asarray([nodes[i] for i in keep_nodes], dtype=float)
+    new_edges = []
+    for i, j in edges:
+        i = int(i); j = int(j)
+        if i in mapping and j in mapping:
+            new_edges.append((mapping[i], mapping[j]))
+    new_edges = np.asarray(sorted(set(tuple(sorted(e)) for e in new_edges)), dtype=int) if new_edges else np.zeros((0,2), dtype=int)
+
+    stats = {
+        'components_total': int(components_total),
+        'components_kept': int(components_kept),
+        'nodes_removed': int(len(nodes) - len(new_nodes)),
+        'edges_removed': int(len(edges) - len(new_edges)),
+    }
+    return new_nodes, new_edges, stats
+
+
 def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict[str, np.ndarray]:
     seeds = sample_variable_density_seeds(width, height, params)
     border_pts = []
@@ -296,8 +358,17 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
     nodes, edges = deduplicate_segments(segs, tol=1e-5, min_len=params.min_edge_len)
     z_levels = np.linspace(0.0, height, params.n_stories + 1)
     nodes, edges = split_edges_at_story_levels(nodes, edges, z_levels, tol=1e-6)
+    nodes, edges, prune_stats = prune_face_graph_to_base(nodes, edges, z_levels, tol=1e-6)
     floor_nodes = collect_floor_node_indices(nodes, z_levels, tol=1e-6)
-    return {"seeds": seeds, "face_nodes": nodes, "face_edges": edges, "floor_nodes": floor_nodes, "width": width, "height": height}
+    return {
+        "seeds": seeds,
+        "face_nodes": nodes,
+        "face_edges": edges,
+        "floor_nodes": floor_nodes,
+        "width": width,
+        "height": height,
+        "prune_stats": prune_stats,
+    }
 
 
 def generate_face_geometry(params: TowerParams) -> Dict[str, object]:
@@ -306,9 +377,6 @@ def generate_face_geometry(params: TowerParams) -> Dict[str, object]:
 
 
 def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, object]:
-    """Costruisce la geometria 3D della torre replicando la facciata 2D sulle 4 facce.
-    Non esegue analisi 3D. Usa la facciata risultante dalla fase 2D.
-    """
     params = TowerParams(**geometry['params'])
     face_nodes = np.asarray(geometry['face']['face_nodes'], dtype=float)
     face_edges = np.asarray(geometry['face']['face_edges'], dtype=int)
@@ -328,7 +396,6 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
     node_map = {}
     tower_nodes = []
     tower_edges = []
-
     def add_node(pt: np.ndarray) -> int:
         key = tuple(int(round(c * 1e6)) for c in pt)
         if key in node_map:
@@ -346,7 +413,6 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
         for i, j in face_edges:
             tower_edges.append(tuple(sorted((local_to_global[int(i)], local_to_global[int(j)]))))
 
-    # nucleo geometrico equivalente
     hc = params.core_size / 2.0
     z_levels = np.linspace(0.0, params.total_height, params.n_stories + 1)
     core_nodes = []
@@ -359,21 +425,12 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
             core_nodes.append([x, y, float(z)])
     for k in range(params.n_stories):
         for c1, c2 in [(0,1), (1,2), (2,3), (3,0)]:
-            core_shells.append([
-                core_map[(k, c1)], core_map[(k, c2)],
-                core_map[(k+1, c2)], core_map[(k+1, c1)]
-            ])
+            core_shells.append([core_map[(k, c1)], core_map[(k, c2)], core_map[(k+1, c2)], core_map[(k+1, c1)]])
 
     return {
         'params': geometry['params'],
-        'tower': {
-            'nodes': np.asarray(tower_nodes, dtype=float),
-            'edges': np.asarray(sorted(set(tower_edges)), dtype=int),
-        },
-        'core': {
-            'nodes': np.asarray(core_nodes, dtype=float),
-            'shells': np.asarray(core_shells, dtype=int),
-        }
+        'tower': {'nodes': np.asarray(tower_nodes, dtype=float), 'edges': np.asarray(sorted(set(tower_edges)), dtype=int)},
+        'core': {'nodes': np.asarray(core_nodes, dtype=float), 'shells': np.asarray(core_shells, dtype=int)}
     }
 
 
@@ -415,10 +472,15 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         ops.node(tag, float(x), float(z), 0.0)
 
     base_node_tags = []
+    constrained_planar_tags = []
     for tag, (_, z) in enumerate(face_nodes, start=1):
         if abs(float(z)) < 1e-8:
             ops.fix(tag, 1, 1, 1, 1, 1, 1)
             base_node_tags.append(tag)
+        else:
+            # Telaio 3D planare nel piano XY: liberi UX, UY, RZ; vincolati UZ, RX, RY
+            ops.fix(tag, 0, 0, 1, 1, 1, 0)
+            constrained_planar_tags.append(tag)
 
     ele_pairs = []
     ele_lengths = []
@@ -526,6 +588,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         'nodes': face_nodes,
         'edges': np.asarray(ele_pairs, dtype=int) - 1,
         'base_node_tags': base_node_tags,
+        'constrained_planar_tags': constrained_planar_tags,
         'node_disp': node_disp,
         'ux': ux,
         'uz': uz,
@@ -588,7 +651,6 @@ def plotly_tower_traces(tower_geometry: Dict[str, object]):
     tower_edges = tower_geometry['tower']['edges']
     core_nodes = tower_geometry['core']['nodes']
     core_shells = tower_geometry['core']['shells']
-
     x_lines, y_lines, z_lines = [], [], []
     for i, j in tower_edges:
         p1 = tower_nodes[int(i)]
@@ -596,10 +658,8 @@ def plotly_tower_traces(tower_geometry: Dict[str, object]):
         x_lines += [p1[0], p2[0], None]
         y_lines += [p1[1], p2[1], None]
         z_lines += [p1[2], p2[2], None]
-
     fig = go.Figure()
     fig.add_trace(go.Scatter3d(x=x_lines, y=y_lines, z=z_lines, mode='lines', name='Esoscheletro 3D', line=dict(color='#0a84ff', width=3)))
-
     cx, cy, cz = [], [], []
     for n1, n2, n3, n4 in core_shells:
         pts = [core_nodes[int(n)] for n in [n1, n2, n3, n4, n1]]

@@ -1,17 +1,15 @@
 
 # Vorogrid 2D -> 3D
 
-In questa fase il progetto si concentra su:
+Focus attuale:
 1. analisi FEM della facciata 2D;
 2. costruzione del 3D a partire dalla facciata 2D;
 3. nessuna analisi FEM 3D.
 
-## Nota tecnica
-La facciata viene analizzata con beam 3D planari per poter assegnare i versori locali di ogni asta:
-- `vx` lungo la trave
-- `vy = (0,0,1)`
-- `vz = vx x vy`
-- `geomTransf('Linear', transfTag, *vz)`
+## Correzioni di stabilità
+- pruning dei componenti non connessi alla base;
+- rimozione dei nodi orfani;
+- modello 3D planare con vincoli UZ=RX=RY per tutti i nodi non di base.
 
 ## Avvio
 ```bash
