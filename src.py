@@ -54,6 +54,12 @@ class TowerParams:
     include_vertical_mass: bool = True
     n_eigen: int = 6
 
+    # Nucleo in c.a.
+    concrete_E: float = 30e9
+    concrete_nu: float = 0.2
+    concrete_rho: float = 2500.0
+    core_t: float = 0.50
+
     @property
     def story_height(self) -> float:
         return self.total_height / self.n_stories
@@ -656,6 +662,301 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     }
 
 
+def _robust_vecxz(vx: np.ndarray) -> np.ndarray:
+    """Vettore ausiliario non parallelo a vx per geomTransf 3D Linear.
+
+    Priorità: [0,0,1] (Z globale); se vx è quasi verticale → [1,0,0].
+    """
+    vx = np.asarray(vx, dtype=float)
+    ref = np.array([0.0, 0.0, 1.0], dtype=float)
+    if abs(float(np.dot(vx, ref))) > 0.95:
+        ref = np.array([1.0, 0.0, 0.0], dtype=float)
+    return ref
+
+
+def build_opensees_tower_model(
+    tower_geometry: Dict[str, object],
+    geometry: Dict[str, object],
+    load_case: str = 'lateral',
+    do_eigen: bool = True,
+) -> Dict[str, object]:
+    """Analisi FEM 3D della torre (ndm=3, ndf=6).
+
+    Elementi strutturali
+    --------------------
+    - Esoscheletro: elasticBeamColumn 3D sulle 4 facce (acciaio SHS).
+    - Nucleo: ShellMITC4 sulle 4 pareti (c.a. ElasticMembranePlateSection).
+
+    Vincoli di piano
+    ----------------
+    - rigidDiaphragm(perpDirn=3, master, *slaves) a ogni livello z_k > 0:
+      collega tutti i nodi esoscheletro e nucleo dello stesso piano.
+      Il master è il primo nodo utile del nucleo; i rimanenti sono slaves.
+      Il diaframma vincola UX, UY, RZ (moto planare rigido);
+      UZ, RX, RY restano indipendenti.
+
+    Robustezza
+    ----------
+    - Pre-filtraggio degli elementi esoscheletro per lunghezza minima.
+    - BFS dalla base: solo nodi raggiunti da elementi validi entrano nel modello.
+    """
+    try:
+        import openseespy.opensees as ops
+    except Exception as exc:
+        raise RuntimeError("OpenSeesPy non disponibile. Installa 'openseespy'.") from exc
+
+    params = TowerParams(**geometry['params'])
+    t_nodes = np.asarray(tower_geometry['tower']['nodes'], dtype=float)   # (N,3) exo
+    t_edges = np.asarray(tower_geometry['tower']['edges'], dtype=int)      # (E,2)
+    c_nodes = np.asarray(tower_geometry['core']['nodes'],  dtype=float)    # (M,3)
+    c_shells = np.asarray(tower_geometry['core']['shells'], dtype=int)     # (S,4)
+
+    z_levels = np.linspace(0.0, params.total_height, params.n_stories + 1)
+    tol_z = 1e-4
+
+    # ── Pre-filtraggio esoscheletro (BFS dalla base) ─────────────────────────
+    L_min = params.min_edge_len * 0.5
+    cand: List[Tuple[int, int, float]] = []
+    for ri, rj in t_edges:
+        fi, fj = int(ri), int(rj)
+        L = float(np.linalg.norm(t_nodes[fi] - t_nodes[fj]))
+        if L >= L_min:
+            cand.append((fi, fj, L))
+
+    base_t = {i for i, (x, y, z) in enumerate(t_nodes) if abs(float(z)) < tol_z}
+    adj_t: Dict[int, List[int]] = defaultdict(list)
+    for fi, fj, _ in cand:
+        adj_t[fi].append(fj); adj_t[fj].append(fi)
+
+    vis: set = set(base_t)
+    q: deque = deque(base_t)
+    while q:
+        u = q.popleft()
+        for v in adj_t[u]:
+            if v not in vis:
+                vis.add(v); q.append(v)
+
+    valid: List[Tuple[int, int, float]] = [(fi, fj, L) for fi, fj, L in cand if fi in vis and fj in vis]
+    if not valid:
+        return {'analysis_ok': False, 'error': 'Nessun elemento esoscheletro valido nel modello 3D.'}
+
+    used_t: set = set()
+    for fi, fj, _ in valid:
+        used_t.add(fi); used_t.add(fj)
+
+    # ── Mapping indici → tag OpenSees ─────────────────────────────────────────
+    t_to_ops: Dict[int, int] = {fi: tag for tag, fi in enumerate(sorted(used_t), start=1)}
+    n_used_t = len(t_to_ops)
+    c_offset = n_used_t  # core tags start at n_used_t+1
+
+    def cr(i: int) -> int:
+        return int(i) + c_offset + 1
+
+    # ── Costruzione modello OpenSees ─────────────────────────────────────────
+    ops.wipe()
+    ops.model('basic', '-ndm', 3, '-ndf', 6)
+
+    for fi, ops_tag in t_to_ops.items():
+        x, y, z = t_nodes[fi]
+        ops.node(ops_tag, float(x), float(y), float(z))
+    for i, (x, y, z) in enumerate(c_nodes):
+        ops.node(cr(i), float(x), float(y), float(z))
+
+    # ── Vincoli di base ───────────────────────────────────────────────────────
+    for fi, ops_tag in t_to_ops.items():
+        if abs(float(t_nodes[fi][2])) < tol_z:
+            ops.fix(ops_tag, 1, 1, 1, 1, 1, 1)
+    for i, (x, y, z) in enumerate(c_nodes):
+        if abs(float(z)) < tol_z:
+            ops.fix(cr(i), 1, 1, 1, 1, 1, 1)
+
+    # ── Esoscheletro: elasticBeamColumn 3D ───────────────────────────────────
+    exo = shs_properties(params.exo_b, params.exo_t, params.steel_G)
+    ele_tag = 1
+    exo_ele_info: List[Tuple[int, int]] = []  # (t_idx_i, t_idx_j)
+
+    for fi, fj, L in valid:
+        vx = (t_nodes[fj] - t_nodes[fi]) / L
+        vcxz = _robust_vecxz(vx)
+        ops.geomTransf('Linear', ele_tag, *[float(v) for v in vcxz])
+        ops.element(
+            'elasticBeamColumn', ele_tag,
+            t_to_ops[fi], t_to_ops[fj],
+            exo['A'], params.steel_E, params.steel_G,
+            exo['J'], exo['Iy'], exo['Iz'], ele_tag,
+            '-mass', exo['A'] * params.steel_rho,
+        )
+        exo_ele_info.append((fi, fj))
+        ele_tag += 1
+
+    n_exo_ele = len(exo_ele_info)
+
+    # ── Nucleo: ShellMITC4 ────────────────────────────────────────────────────
+    ops.section(
+        'ElasticMembranePlateSection', 1,
+        params.concrete_E, params.concrete_nu,
+        params.core_t, params.concrete_rho,
+    )
+    shell_start = ele_tag
+    for n1, n2, n3, n4 in c_shells:
+        ops.element('ShellMITC4', ele_tag, cr(int(n1)), cr(int(n2)), cr(int(n3)), cr(int(n4)), 1)
+        ele_tag += 1
+    n_shell_ele = ele_tag - shell_start
+
+    # ── Masse di piano ────────────────────────────────────────────────────────
+    floor_area_3d = max(params.plan_size ** 2 - params.core_size ** 2, 1.0)
+    g_floor = params.floor_dead_kN_m2 * 1e3 * floor_area_3d
+    q_floor = params.floor_live_kN_m2 * 1e3 * floor_area_3d
+    floor_mass_tot = (g_floor + 0.3 * q_floor) / 9.81
+    wind_floor_N = params.wind_line_kN_m * 1e3 * params.story_height
+
+    floor_t_tags: Dict[int, List[int]] = {}  # k → [ops_tag, ...]
+    floor_c_tags: Dict[int, List[int]] = {}
+    for k, z in enumerate(z_levels):
+        if abs(z) < tol_z:
+            continue
+        ft = [t_to_ops[fi] for fi in sorted(used_t) if abs(float(t_nodes[fi][2]) - z) <= tol_z]
+        fc = [cr(i) for i, (x, y, zn) in enumerate(c_nodes) if abs(float(zn) - z) <= tol_z]
+        if ft or fc:
+            floor_t_tags[k] = ft
+            floor_c_tags[k] = fc
+
+    for k in floor_t_tags:
+        all_fn = floor_t_tags[k] + floor_c_tags.get(k, [])
+        if not all_fn:
+            continue
+        m_node = floor_mass_tot / len(all_fn)
+        mz = m_node if params.include_vertical_mass else 1e-9
+        for tag in all_fn:
+            ops.mass(tag, m_node, m_node, mz, 1e-9, 1e-9, 1e-9)
+
+    # ── Diaframmi rigidi ──────────────────────────────────────────────────────
+    # perpDirn=3 → diaframma ⊥ a Z (piano orizzontale)
+    # Vincola UX, UY, RZ degli slave al master; UZ, RX, RY restano liberi.
+    diaphragm_master: Dict[int, int] = {}
+    for k in floor_t_tags:
+        all_fn = floor_t_tags[k] + floor_c_tags.get(k, [])
+        if len(all_fn) < 2:
+            continue
+        # master: preferisci il primo nodo nucleo (più centrale); fallback su exo
+        fc = floor_c_tags.get(k, [])
+        master = fc[0] if fc else all_fn[0]
+        slaves = [n for n in all_fn if n != master]
+        ops.rigidDiaphragm(3, master, *slaves)
+        diaphragm_master[k] = master
+
+    # ── Carichi ──────────────────────────────────────────────────────────────
+    ops.timeSeries('Linear', 1)
+    ops.pattern('Plain', 1, 1)
+    for k in floor_t_tags:
+        all_fn = floor_t_tags[k] + floor_c_tags.get(k, [])
+        if not all_fn:
+            continue
+        master = diaphragm_master.get(k)
+        if load_case in ('lateral', 'combined') and master:
+            ops.load(master, float(wind_floor_N), 0.0, 0.0, 0.0, 0.0, 0.0)
+        if load_case in ('gravity', 'combined'):
+            fz = -g_floor / len(all_fn)
+            for tag in all_fn:
+                ops.load(tag, 0.0, 0.0, float(fz), 0.0, 0.0, 0.0)
+
+    # ── Analisi statica ───────────────────────────────────────────────────────
+    ops.constraints('Transformation')
+    ops.numberer('RCM')
+    try:
+        ops.system('UmfPack')
+    except Exception:
+        ops.system('BandGeneral')
+    ops.test('NormDispIncr', 1.0e-6, 100)
+    ops.algorithm('Linear')
+    ops.integrator('LoadControl', 1.0)
+    ops.analysis('Static')
+    ok = ops.analyze(1)
+
+    # ── Spostamenti ───────────────────────────────────────────────────────────
+    t_disp = np.zeros((len(t_nodes), 6), dtype=float)
+    for fi, ops_tag in t_to_ops.items():
+        try:
+            t_disp[fi, :] = np.asarray(ops.nodeDisp(ops_tag), dtype=float)
+        except Exception:
+            pass
+
+    c_disp = np.zeros((len(c_nodes), 6), dtype=float)
+    for i in range(len(c_nodes)):
+        try:
+            c_disp[i, :] = np.asarray(ops.nodeDisp(cr(i)), dtype=float)
+        except Exception:
+            pass
+
+    # ── Forze di elemento (esoscheletro) ─────────────────────────────────────
+    exo_quantities: List[Dict] = []
+    for etag in range(1, n_exo_ele + 1):
+        try:
+            f = np.asarray(ops.eleResponse(etag, 'force'), dtype=float)
+        except Exception:
+            f = np.zeros(12, dtype=float)
+        if len(f) >= 12:
+            N = max(abs(float(f[0])), abs(float(f[6])))
+            V = max(abs(float(f[1])), abs(float(f[7])))
+            M = max(abs(float(f[5])), abs(float(f[11])))
+        else:
+            N = V = M = 0.0
+        exo_quantities.append({'N': N, 'V': V, 'M': M})
+
+    # ── Analisi modale ────────────────────────────────────────────────────────
+    eig_vals: List[float] = []
+    periods: List[float] = []
+    if do_eigen:
+        try:
+            eig_vals = list(ops.eigen(params.n_eigen))
+            periods = [2.0 * math.pi / math.sqrt(lmbd) if lmbd > 0 else float('nan') for lmbd in eig_vals]
+        except Exception:
+            pass
+
+    # ── Deriva inter-piano (direzione X) ─────────────────────────────────────
+    ops_to_t = {v: k for k, v in t_to_ops.items()}
+    story_ux: Dict[int, float] = {0: 0.0}
+    for k in floor_t_tags:
+        idxs = [ops_to_t[tag] for tag in floor_t_tags[k]]
+        if idxs:
+            story_ux[k] = float(np.mean(t_disp[idxs, 0]))
+    drift_ratios: List[float] = []
+    for k in range(1, len(z_levels)):
+        if k in story_ux and k - 1 in story_ux:
+            h = float(z_levels[k] - z_levels[k - 1])
+            d = abs(story_ux[k] - story_ux[k - 1])
+            if h > EPS:
+                drift_ratios.append(d / h)
+    max_drift = float(max(drift_ratios)) if drift_ratios else 0.0
+
+    top_z = float(np.max(t_nodes[:, 2]))
+    top_mask = np.abs(t_nodes[:, 2] - top_z) < tol_z
+    top_ux = float(np.mean(np.abs(t_disp[top_mask, 0]))) if np.any(top_mask) else 0.0
+    top_umag = float(np.mean(np.sqrt(t_disp[top_mask, 0] ** 2 + t_disp[top_mask, 1] ** 2))) if np.any(top_mask) else 0.0
+
+    return {
+        'analysis_ok': int(ok) == 0,
+        'load_case': load_case,
+        'tower_nodes': t_nodes,
+        'valid_edges': valid,
+        'core_nodes': c_nodes,
+        'core_shells': c_shells,
+        'tower_disp': t_disp,
+        'core_disp': c_disp,
+        'exo_quantities': exo_quantities,
+        'eigenvalues': eig_vals,
+        'periods_s': periods,
+        'top_ux': top_ux,
+        'top_umag': top_umag,
+        'max_drift_ratio': max_drift,
+        'story_ux': story_ux,
+        'n_exo_nodes': len(used_t),
+        'n_exo_elements': n_exo_ele,
+        'n_shell_elements': n_shell_ele,
+        'n_core_nodes': len(c_nodes),
+    }
+
+
 def _safe_min_max(values: Iterable[float]) -> Tuple[float, float]:
     vals = [float(v) for v in values]
     if not vals:
@@ -790,6 +1091,127 @@ def plotly_face_displacement_map(face_result: Dict[str, object], component: str 
     fig.add_trace(go.Scatter(x=x_lines, y=z_lines, mode='lines', name='Mesh', line=dict(color='rgba(90,90,90,0.30)', width=1.2)))
     fig.add_trace(go.Scatter(x=nodes[:, 0], y=nodes[:, 1], mode='markers', name=component, marker=dict(size=6, color=vals, colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title=component)), customdata=np.column_stack([face_result['ux'], face_result['uz'], face_result['umag']]), hovertemplate='x=%{x:.2f} m<br>z=%{y:.2f} m<br>ux=%{customdata[0]:.4e} m<br>uz=%{customdata[1]:.4e} m<br>|u|=%{customdata[2]:.4e} m<extra></extra>'))
     fig.update_layout(title=f'Facciata 2D – mappa spostamenti nodali ({component})', xaxis_title='Sviluppo facciata [m]', yaxis_title='Quota z [m]', yaxis_scaleanchor='x', template='plotly_white', height=760)
+    return fig
+
+
+def plotly_tower_deformed_traces(tower_result: Dict[str, object], scale: float = 10.0):
+    """Deformata 3D dell'esoscheletro colorata per |u| nodale."""
+    import plotly.graph_objects as go
+
+    t_nodes = np.asarray(tower_result['tower_nodes'], dtype=float)
+    valid_edges = tower_result['valid_edges']        # list of (fi, fj, L)
+    t_disp = np.asarray(tower_result['tower_disp'], dtype=float)
+    c_nodes = np.asarray(tower_result['core_nodes'], dtype=float)
+    c_shells = np.asarray(tower_result['core_shells'], dtype=int)
+    c_disp = np.asarray(tower_result['core_disp'], dtype=float)
+
+    deformed_t = t_nodes.copy()
+    deformed_t[:, 0] += t_disp[:, 0] * scale
+    deformed_t[:, 1] += t_disp[:, 1] * scale
+    deformed_t[:, 2] += t_disp[:, 2] * scale
+
+    # Linee indeformate (grigio trasparente)
+    xu, yu, zu = [], [], []
+    for fi, fj, _ in valid_edges:
+        p1, p2 = t_nodes[fi], t_nodes[fj]
+        xu += [p1[0], p2[0], None]; yu += [p1[1], p2[1], None]; zu += [p1[2], p2[2], None]
+
+    # Linee deformate (rosso)
+    xd, yd, zd = [], [], []
+    for fi, fj, _ in valid_edges:
+        p1, p2 = deformed_t[fi], deformed_t[fj]
+        xd += [p1[0], p2[0], None]; yd += [p1[1], p2[1], None]; zd += [p1[2], p2[2], None]
+
+    # Nucleo: pareti deformate
+    deformed_c = c_nodes.copy()
+    deformed_c[:, 0] += c_disp[:, 0] * scale
+    deformed_c[:, 1] += c_disp[:, 1] * scale
+    deformed_c[:, 2] += c_disp[:, 2] * scale
+    xc, yc, zc = [], [], []
+    for n1, n2, n3, n4 in c_shells:
+        pts = [deformed_c[int(n)] for n in [n1, n2, n3, n4, n1]]
+        for a, b in zip(pts[:-1], pts[1:]):
+            xc += [a[0], b[0], None]; yc += [a[1], b[1], None]; zc += [a[2], b[2], None]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=xu, y=yu, z=zu, mode='lines',
+                               name='Indeformata', line=dict(color='rgba(180,180,180,0.35)', width=1)))
+    fig.add_trace(go.Scatter3d(x=xd, y=yd, z=zd, mode='lines',
+                               name=f'Esoscheletro ×{scale:g}', line=dict(color='#e63946', width=2)))
+    fig.add_trace(go.Scatter3d(x=xc, y=yc, z=zc, mode='lines',
+                               name=f'Nucleo ×{scale:g}', line=dict(color='#f4a261', width=3)))
+    fig.update_layout(
+        title=f'Torre 3D – deformata ×{scale:g} (caso: {tower_result.get("load_case","?")})',
+        scene=dict(xaxis_title='X [m]', yaxis_title='Y [m]', zaxis_title='Z [m]', aspectmode='data'),
+        template='plotly_white', height=850,
+    )
+    return fig
+
+
+def plotly_tower_force_map(tower_result: Dict[str, object], quantity: str = 'N'):
+    """Mappa delle forze dell'esoscheletro 3D."""
+    import plotly.graph_objects as go
+
+    t_nodes = np.asarray(tower_result['tower_nodes'], dtype=float)
+    valid_edges = tower_result['valid_edges']
+    exo_q = tower_result['exo_quantities']
+    vals = np.asarray([float(q.get(quantity, 0.0)) for q in exo_q], dtype=float)
+    colors, vmin, vmax = _sample_colors('Turbo', vals)
+
+    fig = go.Figure()
+    for eidx, (fi, fj, _) in enumerate(valid_edges):
+        p1, p2 = t_nodes[fi], t_nodes[fj]
+        v = vals[eidx]
+        fig.add_trace(go.Scatter3d(
+            x=[p1[0], p2[0]], y=[p1[1], p2[1]], z=[p1[2], p2[2]],
+            mode='lines', showlegend=False,
+            line=dict(color=colors[eidx], width=2),
+            hovertemplate=f'{quantity}={v:.4e}<extra></extra>',
+        ))
+    # Colorbar ghost trace
+    fig.add_trace(go.Scatter3d(
+        x=[t_nodes[0, 0]], y=[t_nodes[0, 1]], z=[t_nodes[0, 2]],
+        mode='markers', showlegend=False,
+        marker=dict(size=0.1, color=[vmin, vmax], colorscale='Turbo',
+                    cmin=vmin, cmax=vmax, colorbar=dict(title=quantity)),
+        hoverinfo='skip',
+    ))
+    fig.update_layout(
+        title=f'Esoscheletro 3D – mappa {quantity}',
+        scene=dict(xaxis_title='X [m]', yaxis_title='Y [m]', zaxis_title='Z [m]', aspectmode='data'),
+        template='plotly_white', height=800,
+    )
+    return fig
+
+
+def plotly_tower_drift_profile(tower_result: Dict[str, object], story_height: float):
+    """Profilo di spostamento e drift inter-piano del modello 3D."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    story_ux = tower_result.get('story_ux', {})
+    if not story_ux:
+        return go.Figure()
+    levels = sorted(story_ux.keys())
+    z_vals = [k * story_height for k in levels]
+    ux_vals = [story_ux[k] for k in levels]
+    drift_vals, drift_z = [], []
+    for k in range(1, len(levels)):
+        h = story_height
+        d = abs(ux_vals[k] - ux_vals[k - 1])
+        drift_vals.append(d / h if h > EPS else 0.0)
+        drift_z.append((z_vals[k] + z_vals[k - 1]) / 2.0)
+
+    fig = make_subplots(rows=1, cols=2, shared_yaxes=True,
+                        subplot_titles=['Spost. medio di piano [m]', 'Drift inter-piano [−]'])
+    fig.add_trace(go.Scatter(x=ux_vals, y=z_vals, mode='lines+markers', name='ux medio',
+                             line=dict(color='#0a84ff', width=2), marker=dict(size=4)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=drift_vals, y=drift_z, mode='lines+markers', name='drift 3D',
+                             line=dict(color='#ff3b30', width=2), marker=dict(size=4)), row=1, col=2)
+    fig.add_vline(x=story_height / 500.0, line_dash='dot', line_color='orange',
+                  annotation_text='h/500', row=1, col=2)
+    fig.update_layout(title='Profilo deriva 3D', template='plotly_white', height=600)
+    fig.update_yaxes(title_text='Quota z [m]', row=1, col=1)
     return fig
 
 
