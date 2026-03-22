@@ -274,6 +274,66 @@ def collect_floor_node_indices(nodes: np.ndarray, z_levels: np.ndarray, tol: flo
     return out
 
 
+def remove_dangling_nodes(nodes: np.ndarray, edges: np.ndarray, z_levels: np.ndarray, tol: float = 1e-6):
+    """Rimuove iterativamente i nodi connessi a un solo elemento (grado 1).
+
+    I nodi di base (z ≈ z_levels[0]) sono preservati anche se di grado 1,
+    perché strutturalmente vincolati. Tutti gli altri nodi devono essere
+    connessi ad almeno due elementi per garantire un'analisi FEM coerente.
+
+    L'algoritmo è applicato in modo iterativo finché non esistono più nodi
+    pendenti: rimuovendo un nodo pendente può rendere pendente il suo vicino.
+    """
+    base_z = float(z_levels[0])
+    nodes = np.asarray(nodes, dtype=float)
+    edges_set: set = set(tuple(sorted((int(i), int(j)))) for i, j in edges)
+
+    total_removed_nodes = 0
+    total_removed_edges = 0
+
+    while True:
+        # Grado di ogni nodo
+        degree: Dict[int, int] = defaultdict(int)
+        for i, j in edges_set:
+            degree[i] += 1
+            degree[j] += 1
+
+        # Nodi di grado 1 non di base (liberi → instabili in FEM)
+        dangling = {
+            idx for idx in range(len(nodes))
+            if degree.get(idx, 0) == 1
+            and abs(float(nodes[idx][1]) - base_z) > tol
+        }
+
+        if not dangling:
+            break
+
+        edges_to_remove = {e for e in edges_set if e[0] in dangling or e[1] in dangling}
+        edges_set -= edges_to_remove
+        total_removed_edges += len(edges_to_remove)
+        total_removed_nodes += len(dangling)
+
+    # Rimappa gli indici dei nodi ancora attivi
+    used_nodes: set = set()
+    for i, j in edges_set:
+        used_nodes.add(i)
+        used_nodes.add(j)
+
+    keep_nodes = sorted(used_nodes)
+    mapping = {old: new for new, old in enumerate(keep_nodes)}
+    new_nodes = np.asarray([nodes[i] for i in keep_nodes], dtype=float)
+    new_edges = (
+        np.asarray(sorted((mapping[i], mapping[j]) for i, j in edges_set), dtype=int)
+        if edges_set else np.zeros((0, 2), dtype=int)
+    )
+
+    stats = {
+        'dangling_nodes_removed': total_removed_nodes,
+        'dangling_edges_removed': total_removed_edges,
+    }
+    return new_nodes, new_edges, stats
+
+
 def prune_face_graph_to_base(nodes: np.ndarray, edges: np.ndarray, z_levels: np.ndarray, tol: float = 1e-6):
     """Mantiene solo i componenti connessi che contengono almeno un nodo di base.
     Rimuove anche nodi orfani (non incidenti ad alcuna asta).
@@ -366,6 +426,7 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
     z_levels = np.linspace(0.0, height, params.n_stories + 1)
     nodes, edges = split_edges_at_story_levels(nodes, edges, z_levels, tol=1e-6)
     nodes, edges, prune_stats = prune_face_graph_to_base(nodes, edges, z_levels, tol=1e-6)
+    nodes, edges, dangling_stats = remove_dangling_nodes(nodes, edges, z_levels, tol=1e-6)
     floor_nodes = collect_floor_node_indices(nodes, z_levels, tol=1e-6)
     return {
         "seeds": seeds,
@@ -374,7 +435,7 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
         "floor_nodes": floor_nodes,
         "width": width,
         "height": height,
-        "prune_stats": prune_stats,
+        "prune_stats": {**prune_stats, **dangling_stats},
     }
 
 
@@ -684,15 +745,36 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
 
 
 def _robust_vecxz(vx: np.ndarray) -> np.ndarray:
-    """Vettore ausiliario non parallelo a vx per geomTransf 3D Linear.
+    """Versore ortogonale a vx per geomTransf 3D Linear.
 
-    Priorità: [0,0,1] (Z globale); se vx è quasi verticale → [1,0,0].
+    Calcola il vettore ausiliario (vecxz) richiesto da OpenSees tramite
+    proiezione di Gram-Schmidt: il risultato è garantito ortogonale alla
+    direzione dell'elemento e normalizzato a 1.
+
+    Ordine di preferenza per il vettore di riferimento:
+      1. Z globale [0, 0, 1]  – per elementi prevalentemente orizzontali
+      2. Y globale [0, 1, 0]  – fallback se vx è quasi verticale in Z
+      3. X globale [1, 0, 0]  – fallback finale
+
+    Il vettore scelto deve formare un angolo > ~17° con vx (|cosθ| < 0.95)
+    affinché la proiezione sia numericamente stabile.
     """
     vx = np.asarray(vx, dtype=float)
-    ref = np.array([0.0, 0.0, 1.0], dtype=float)
-    if abs(float(np.dot(vx, ref))) > 0.95:
-        ref = np.array([1.0, 0.0, 0.0], dtype=float)
-    return ref
+    vx = vx / (np.linalg.norm(vx) + 1e-16)  # normalizza per sicurezza
+
+    for ref in (
+        np.array([0.0, 0.0, 1.0]),
+        np.array([0.0, 1.0, 0.0]),
+        np.array([1.0, 0.0, 0.0]),
+    ):
+        # Gram-Schmidt: proietta ref sul piano perpendicolare a vx
+        perp = ref - float(np.dot(ref, vx)) * vx
+        norm = np.linalg.norm(perp)
+        if norm > 0.3:           # equivalente a |cosθ| < ~0.954 con vx
+            return perp / norm
+
+    # Fallback teoricamente irraggiungibile
+    return np.array([0.0, 0.0, 1.0])
 
 
 def build_opensees_tower_model(
