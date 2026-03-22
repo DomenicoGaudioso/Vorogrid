@@ -53,6 +53,7 @@ class TowerParams:
     wind_line_kN_m: float = 200.0
     include_vertical_mass: bool = True
     n_eigen: int = 6
+    use_floor_diaphragm: bool = True   # equalDOF UX ai piani nel modello 2D
 
     # Nucleo in c.a.
     concrete_E: float = 30e9
@@ -502,6 +503,21 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
     face_to_ops: Dict[int, int] = {fi: tag for tag, fi in enumerate(sorted(used_face), start=1)}
     ops_to_face: Dict[int, int] = {v: k for k, v in face_to_ops.items()}
 
+    # ── Diaframma rigido 2D (equalDOF in UX) ────────────────────────────────
+    # Collega tutti i nodi allo stesso livello di piano con lo stesso UX
+    # (simula il solaio rigido nel piano, impedisce che catene Voronoi
+    # non collegate si deformino indipendentemente).
+    diaphragm_masters_2d: Dict[int, int] = {}  # k → ops_tag del nodo master
+    if params.use_floor_diaphragm:
+        for k in range(1, len(z_levels)):
+            sn = [face_to_ops[int(i)] for i in floor_nodes.get(k, []) if int(i) in face_to_ops]
+            if len(sn) < 2:
+                continue
+            master_tag = sn[0]
+            diaphragm_masters_2d[k] = master_tag
+            for slave_tag in sn[1:]:
+                ops.equalDOF(master_tag, slave_tag, 1)  # DOF 1 = UX
+
     floor_area_face = max((params.plan_size ** 2 - params.core_size ** 2) / 4.0, 1.0)
     g_floor = params.floor_dead_kN_m2 * 1e3 * floor_area_face
     q_floor = params.floor_live_kN_m2 * 1e3 * floor_area_face
@@ -558,9 +574,14 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         if not sn:
             continue
         if load_case in ('lateral', 'combined'):
-            px = wind_story_face / len(sn)
-            for tag in sn:
-                ops.load(tag, px, 0.0, 0.0)
+            # Con diaframma: tutto il carico laterale al nodo master
+            # Senza diaframma: distribuito a tutti i nodi del piano
+            if params.use_floor_diaphragm and k in diaphragm_masters_2d:
+                ops.load(diaphragm_masters_2d[k], float(wind_story_face), 0.0, 0.0)
+            else:
+                px = wind_story_face / len(sn)
+                for tag in sn:
+                    ops.load(tag, px, 0.0, 0.0)
         if load_case in ('gravity', 'combined'):
             py = -g_floor / len(sn)
             for tag in sn:

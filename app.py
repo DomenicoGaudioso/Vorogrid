@@ -78,7 +78,14 @@ with st.sidebar:
     dead    = st.number_input("Carico perm. solaio [kN/m²]", min_value=0.0, max_value=20.0,   value=7.0,   step=0.1)
     live    = st.number_input("Carico var. solaio [kN/m²]",  min_value=0.0, max_value=20.0,   value=3.0,   step=0.1)
     wind    = st.number_input("Vento uniforme [kN/m]",        min_value=0.0, max_value=1000.0, value=200.0, step=5.0)
-    include_vertical_mass = st.checkbox("Includi massa verticale nodale", value=True)
+    include_vertical_mass   = st.checkbox("Includi massa verticale nodale", value=True)
+    use_floor_diaphragm    = st.checkbox(
+        "Diaframma rigido ai piani 2D (equalDOF in UX)",
+        value=True,
+        help="Collega con equalDOF tutti i nodi dello stesso livello in UX. "
+             "Simula il solaio rigido nel piano; impedisce che catene Voronoi "
+             "non direttamente collegate si deformino indipendentemente.",
+    )
     n_eigen = st.slider("Modi propri", min_value=1, max_value=20, value=6, step=1)
     face_load_case  = st.selectbox("Caso carico 2D",  ["combined", "lateral", "gravity"], index=0)
     tower_load_case = st.selectbox("Caso carico 3D",  ["lateral", "combined", "gravity"], index=0)
@@ -100,7 +107,9 @@ if run2d_btn:
         belt_strength=belt_strength, corner_strength=corner_strength,
         base_strength=base_strength, mode=mode, exo_b=exo_b, exo_t=exo_t,
         floor_dead_kN_m2=dead, floor_live_kN_m2=live, wind_line_kN_m=wind,
-        include_vertical_mass=include_vertical_mass, n_eigen=int(n_eigen),
+        include_vertical_mass=include_vertical_mass,
+        use_floor_diaphragm=bool(use_floor_diaphragm),
+        n_eigen=int(n_eigen),
         concrete_E=float(concrete_E) * 1e9, concrete_nu=float(concrete_nu),
         concrete_rho=float(concrete_rho), core_t=float(core_t),
     )
@@ -207,11 +216,12 @@ with tab2:
                   delta=f"{'OK' if top_ux <= h_lim else 'SUPERA'}",
                   delta_color="normal" if top_ux <= h_lim else "inverse")
 
+        diaphragm_info = "diaframma rigido ai piani (equalDOF UX)" if use_floor_diaphragm else "SENZA diaframma di piano"
         st.caption(
             f"Modello 2D: {face_analysis.get('n_active_nodes', '?')} nodi attivi "
-            f"({len(face_analysis.get('base_node_tags',[]))} incastrati); "
-            f"{face_analysis.get('n_active_elements', '?')} elementi. "
-            f"Nodi geometria: {len(face['face_nodes'])}."
+            f"({len(face_analysis.get('base_node_tags',[]))} incastrati alla base) · "
+            f"{face_analysis.get('n_active_elements', '?')} elementi · "
+            f"{diaphragm_info}."
         )
 
         copt1, copt2, copt3 = st.columns(3)
