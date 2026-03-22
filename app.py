@@ -1,8 +1,9 @@
 
 """app.py
-Interfaccia Streamlit SOLO per modello 2D della facciata Voronoi.
-Esecuzione:
-    streamlit run app.py
+Focus su:
+- analisi FEM della facciata 2D;
+- costruzione del 3D a valle della facciata 2D;
+- nessuna analisi FEM 3D in questa fase.
 """
 
 from __future__ import annotations
@@ -14,19 +15,23 @@ from src import (
     TowerParams,
     generate_face_geometry,
     build_opensees_face_model,
+    build_tower_geometry_from_face,
     plotly_face_traces,
+    plotly_tower_traces,
     plotly_face_deformed_shape,
     plotly_face_force_map,
     plotly_face_displacement_map,
     export_geometry_json,
 )
 
-st.set_page_config(page_title="Vorogrid Face 2D + OpenSees", layout="wide")
+st.set_page_config(page_title="Vorogrid 2D -> 3D", layout="wide")
 
-st.title("Vorogrid Face 2D + OpenSees")
+st.title("Vorogrid: analisi 2D della facciata + costruzione 3D")
 st.caption(
-    "Versione corretta per l'analisi della sola facciata 2D da ottimizzare. "
-    "L'app esegue esclusivamente il modello OpenSeesPy 2D della mesh Voronoi."
+    "In questa fase l'app si concentra su due passaggi: "
+    "(1) analisi FEM della facciata 2D e "
+    "(2) costruzione del modello geometrico 3D a partire dalla facciata 2D. "
+    "L'analisi FEM 3D non viene eseguita."
 )
 
 with st.sidebar:
@@ -51,19 +56,22 @@ with st.sidebar:
     exo_b = st.number_input("SHS lato esterno [m]", min_value=0.15, max_value=3.0, value=1.10, step=0.01)
     exo_t = st.number_input("SHS spessore [m]", min_value=0.01, max_value=0.40, value=0.09, step=0.01)
 
-    st.header("Carichi base modello 2D")
+    st.header("Carichi modello 2D")
     dead = st.number_input("Carico permanente solaio [kN/m²]", min_value=0.0, max_value=20.0, value=7.0, step=0.1)
     live = st.number_input("Carico variabile solaio [kN/m²]", min_value=0.0, max_value=20.0, value=3.0, step=0.1)
     wind = st.number_input("Azione vento uniforme [kN/m]", min_value=0.0, max_value=1000.0, value=200.0, step=5.0)
+    include_vertical_mass = st.checkbox("Includi massa verticale nodale", value=True)
     n_eigen = st.slider("Numero modi propri", min_value=1, max_value=20, value=6, step=1)
-    face_load_case = st.selectbox("Caso di carico FEM 2D", ["combined", "lateral", "gravity"], index=0)
+    face_load_case = st.selectbox("Caso di carico 2D", ["combined", "lateral", "gravity"], index=0)
 
-    run_btn = st.button("Genera facciata + run FEM 2D", type="primary")
+    run_btn = st.button("Genera 2D + esegui 2D + costruisci 3D", type="primary")
 
 if 'geometry' not in st.session_state:
     st.session_state.geometry = None
 if 'face_analysis' not in st.session_state:
     st.session_state.face_analysis = None
+if 'tower_geometry' not in st.session_state:
+    st.session_state.tower_geometry = None
 
 if run_btn:
     params = TowerParams(
@@ -84,9 +92,10 @@ if run_btn:
         floor_dead_kN_m2=dead,
         floor_live_kN_m2=live,
         wind_line_kN_m=wind,
+        include_vertical_mass=include_vertical_mass,
         n_eigen=int(n_eigen),
     )
-    with st.spinner("Genero la facciata Voronoi e lancio il modello OpenSeesPy 2D..."):
+    with st.spinner("Genero la facciata, eseguo il FEM 2D e costruisco il 3D..."):
         geometry = generate_face_geometry(params)
         st.session_state.geometry = geometry
         try:
@@ -94,12 +103,15 @@ if run_btn:
         except Exception as exc:
             face_analysis = {"analysis_ok": False, "error": str(exc)}
         st.session_state.face_analysis = face_analysis
+        tower_geometry = build_tower_geometry_from_face(geometry)
+        st.session_state.tower_geometry = tower_geometry
 
 geometry = st.session_state.geometry
 face_analysis = st.session_state.face_analysis
+tower_geometry = st.session_state.tower_geometry
 
 if geometry is None:
-    st.info("Imposta i parametri nella barra laterale e premi **Genera facciata + run FEM 2D**.")
+    st.info("Imposta i parametri nella barra laterale e premi **Genera 2D + esegui 2D + costruisci 3D**.")
     st.stop()
 
 face = geometry['face']
@@ -110,14 +122,14 @@ c2.metric("Aste facciata", len(face['face_edges']))
 c3.metric("Seed Voronoi", len(face['seeds']))
 c4.metric("Livelli", len(face['floor_nodes']))
 
-tab1, tab2, tab3 = st.tabs(["Geometria 2D", "Risultati FEM 2D", "Esporta"])
+tab1, tab2, tab3, tab4 = st.tabs(["Facciata 2D", "Analisi 2D", "Costruzione 3D", "Esporta"])
 
 with tab1:
     st.plotly_chart(plotly_face_traces(face), use_container_width=True)
-    st.write("Questa è la mesh Voronoi della facciata che verrà ottimizzata. Gli spigoli sono già spezzati ai livelli di piano.")
+    st.write("Questa è la facciata Voronoi 2D che alimenta sia il FEM 2D sia la costruzione del 3D.")
 
 with tab2:
-    st.subheader("Visualizzazione risultati FEM del modello 2D della facciata")
+    st.subheader("Analisi FEM della facciata 2D")
     if face_analysis is None:
         st.warning("Nessun risultato FEM 2D disponibile.")
     elif face_analysis.get('analysis_ok', False):
@@ -143,19 +155,34 @@ with tab2:
 
         periods = face_analysis.get('periods_s', [])
         if periods:
-            st.subheader("Modi propri del modello 2D di facciata")
+            st.subheader("Modi propri 2D")
             st.dataframe(pd.DataFrame({"Modo": list(range(1, len(periods) + 1)), "Periodo [s]": periods}), use_container_width=True)
 
-        qdf = pd.DataFrame(face_analysis.get('elem_quantities', []))
-        if not qdf.empty:
-            st.subheader("Statistiche rapide sulle azioni di elemento")
-            st.dataframe(qdf.describe().T, use_container_width=True)
+        axes = pd.DataFrame(face_analysis.get('elem_local_axes', []))
+        if not axes.empty:
+            st.subheader("Versori locali dei primi elementi")
+            st.dataframe(axes.head(20), use_container_width=True)
     else:
-        st.error("La geometria è stata generata, ma OpenSeesPy non ha completato l'analisi 2D.")
+        st.error("La facciata è stata generata, ma OpenSeesPy non ha completato l'analisi 2D.")
         if isinstance(face_analysis, dict) and face_analysis.get('error'):
             st.code(face_analysis['error'])
-        st.info("Installa `openseespy` per eseguire il run del modello 2D all'interno dell'app.")
+        st.info("Installa `openseespy` per eseguire il run del modello 2D nell'app.")
 
 with tab3:
-    st.download_button("Scarica geometria JSON", data=export_geometry_json(geometry), file_name="vorogrid_face_geometry.json", mime="application/json")
+    st.subheader("Costruzione del 3D a partire dalla facciata 2D")
+    if tower_geometry is not None:
+        st.plotly_chart(plotly_tower_traces(tower_geometry), use_container_width=True)
+        st.write("Qui viene costruita la geometria 3D della torre replicando la facciata 2D sulle quattro facce e aggiungendo un nucleo geometrico equivalente. In questa fase non viene eseguita l'analisi 3D.")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Nodi esoscheletro 3D", len(tower_geometry['tower']['nodes']))
+        m2.metric("Aste esoscheletro 3D", len(tower_geometry['tower']['edges']))
+        m3.metric("Nodi nucleo 3D", len(tower_geometry['core']['nodes']))
+        m4.metric("Shell nucleo 3D", len(tower_geometry['core']['shells']))
+    else:
+        st.warning("Nessuna geometria 3D disponibile.")
+
+with tab4:
+    st.download_button("Scarica geometria facciata JSON", data=export_geometry_json(geometry), file_name="vorogrid_face_geometry.json", mime="application/json")
+    if tower_geometry is not None:
+        st.download_button("Scarica geometria torre 3D JSON", data=export_geometry_json(tower_geometry), file_name="vorogrid_tower_geometry.json", mime="application/json")
     st.code("streamlit run app.py", language="bash")

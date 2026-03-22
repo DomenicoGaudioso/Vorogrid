@@ -1,12 +1,16 @@
 
 """src.py
-Generazione di una facciata Voronoi per torre a pianta quadrata e analisi FEM 2D
-in OpenSeesPy della sola facciata da ottimizzare.
+Pipeline focalizzata su:
+1) generazione e analisi FEM della sola facciata 2D Voronoi;
+2) costruzione del modello geometrico 3D a partire dalla facciata 2D.
 
-Correzioni applicate rispetto alla versione precedente:
-1) uso di rigidDiaphragm in 2D invece di equalDOF per il comportamento di piano;
-2) query corretta delle forze degli elasticBeamColumn: 'force' (singolare);
-3) la UI esegue solo il modello 2D della facciata.
+In questa versione NON viene eseguita l'analisi FEM 3D.
+La facciata è analizzata con beam 3D planari, così ogni elemento riceve una
+trasformazione locale esplicita derivata dai versori:
+    vx = lungo asta
+    vy = (0,0,1)
+    vz = vx x vy
+con vecxz = vz passato a geomTransf('Linear', ...).
 """
 
 from __future__ import annotations
@@ -24,7 +28,6 @@ EPS = 1e-9
 
 @dataclass
 class TowerParams:
-    # Geometria globale
     plan_size: float = 53.0
     total_height: float = 351.0
     n_stories: int = 90
@@ -38,19 +41,18 @@ class TowerParams:
     base_strength: float = 2.5
     mode: str = "adaptive"   # adaptive | random | megaframe | belts
 
-    # Acciaio esoscheletro
+    # materiale / sezione esoscheletro
     steel_E: float = 210e9
     steel_G: float = 81e9
     steel_rho: float = 7850.0
-    fy_steel: float = 275e6
     exo_b: float = 1.10
     exo_t: float = 0.09
 
-    # Carichi base per facciata 2D
+    # carichi per facciata 2D
     floor_dead_kN_m2: float = 7.0
     floor_live_kN_m2: float = 3.0
     wind_line_kN_m: float = 200.0
-
+    include_vertical_mass: bool = True
     n_eigen: int = 6
 
     @property
@@ -110,7 +112,6 @@ def rectangle_clip_polygon(poly: List[np.ndarray], xmin: float, xmax: float, ymi
 def voronoi_finite_polygons_2d(vor: Voronoi, radius: Optional[float] = None):
     if vor.points.shape[1] != 2:
         raise ValueError("Richiesti punti 2D")
-
     new_regions = []
     new_vertices = vor.vertices.tolist()
     center = vor.points.mean(axis=0)
@@ -127,7 +128,6 @@ def voronoi_finite_polygons_2d(vor: Voronoi, radius: Optional[float] = None):
         if all(v >= 0 for v in vertices):
             new_regions.append(vertices)
             continue
-
         ridges = all_ridges[p1]
         new_region = [v for v in vertices if v >= 0]
         for p2, v1, v2 in ridges:
@@ -135,7 +135,6 @@ def voronoi_finite_polygons_2d(vor: Voronoi, radius: Optional[float] = None):
                 v1, v2 = v2, v1
             if v1 >= 0:
                 continue
-
             tangent = vor.points[p2] - vor.points[p1]
             tangent /= np.linalg.norm(tangent)
             normal = np.array([-tangent[1], tangent[0]])
@@ -144,20 +143,17 @@ def voronoi_finite_polygons_2d(vor: Voronoi, radius: Optional[float] = None):
             far_point = vor.vertices[v2] + direction * radius
             new_region.append(len(new_vertices))
             new_vertices.append(far_point.tolist())
-
         vs = np.asarray([new_vertices[v] for v in new_region])
         c = vs.mean(axis=0)
         angles = np.arctan2(vs[:, 1] - c[1], vs[:, 0] - c[0])
         new_region = [v for _, v in sorted(zip(angles, new_region))]
         new_regions.append(new_region)
-
     return new_regions, np.asarray(new_vertices)
 
 
 def _weight_field(x: np.ndarray, z: np.ndarray, width: float, height: float, params: TowerParams) -> np.ndarray:
     x_local = (x - width / 2.0) / (width / 2.0 + EPS)
     z_local = z / (height + EPS)
-
     w = np.ones_like(x, dtype=float)
     if params.mode in ("adaptive", "belts", "megaframe"):
         corner = np.abs(x_local) ** 1.5
@@ -168,12 +164,10 @@ def _weight_field(x: np.ndarray, z: np.ndarray, width: float, height: float, par
             zc = lvl * params.story_height
             sigma = 2.0 * params.story_height
             w *= 1.0 + params.belt_strength * np.exp(-0.5 * ((z - zc) / sigma) ** 2)
-
     if params.mode == "megaframe":
         diag1 = np.exp(-((z_local - (x / width)) ** 2) / 0.02)
         diag2 = np.exp(-((z_local - (1.0 - x / width)) ** 2) / 0.02)
         w *= 1.0 + 1.8 * np.maximum(diag1, diag2)
-
     if params.mode == "random":
         w = np.ones_like(x)
     return np.clip(w, 1e-6, None)
@@ -210,7 +204,6 @@ def sample_variable_density_seeds(width: float, height: float, params: TowerPara
         zz = min(height, max(0.0, lvl * params.story_height))
         xs = np.linspace(0.0, width, max(6, n_edge // 2))
         anchors.extend([[xx, zz] for xx in xs])
-
     seeds = np.vstack([seeds, np.asarray(anchors, dtype=float)])
     return unique_points_2d(seeds, tol=0.08)
 
@@ -219,7 +212,6 @@ def deduplicate_segments(segments: Iterable[Tuple[np.ndarray, np.ndarray]], tol:
     node_map: Dict[Tuple[int, int], int] = {}
     nodes: List[np.ndarray] = []
     edges_set = set()
-
     def add_node(p: np.ndarray) -> int:
         key = (round(float(p[0]) / tol), round(float(p[1]) / tol))
         if key in node_map:
@@ -228,7 +220,6 @@ def deduplicate_segments(segments: Iterable[Tuple[np.ndarray, np.ndarray]], tol:
         nodes.append(np.asarray(p, dtype=float))
         node_map[key] = idx
         return idx
-
     for a, b in segments:
         if np.linalg.norm(a - b) < min_len - EPS:
             continue
@@ -237,21 +228,18 @@ def deduplicate_segments(segments: Iterable[Tuple[np.ndarray, np.ndarray]], tol:
         if i == j:
             continue
         edges_set.add(tuple(sorted((i, j))))
-
     return np.asarray(nodes, dtype=float), np.asarray(sorted(edges_set), dtype=int)
 
 
 def split_edges_at_story_levels(nodes: np.ndarray, edges: np.ndarray, z_levels: np.ndarray, tol: float = 1e-8):
     new_nodes = nodes.tolist()
     new_edges = []
-
     for i, j in edges:
         p1 = nodes[i]
         p2 = nodes[j]
         if abs(p1[1] - p2[1]) < tol:
             new_edges.append((i, j))
             continue
-
         cuts = [p1, p2]
         zmin, zmax = sorted([p1[1], p2[1]])
         for zc in z_levels:
@@ -259,11 +247,8 @@ def split_edges_at_story_levels(nodes: np.ndarray, edges: np.ndarray, z_levels: 
                 t = (zc - p1[1]) / (p2[1] - p1[1])
                 x = p1[0] + t * (p2[0] - p1[0])
                 cuts.append(np.array([x, zc], dtype=float))
-
         cuts = np.asarray(cuts, dtype=float)
-        ts = np.linalg.norm(cuts - p1, axis=1)
-        cuts = cuts[np.argsort(ts)]
-
+        cuts = cuts[np.argsort(np.linalg.norm(cuts - p1, axis=1))]
         idxs = []
         for pt in cuts:
             idx = len(new_nodes)
@@ -272,7 +257,6 @@ def split_edges_at_story_levels(nodes: np.ndarray, edges: np.ndarray, z_levels: 
         for a, b in zip(idxs[:-1], idxs[1:]):
             if np.linalg.norm(np.asarray(new_nodes[a]) - np.asarray(new_nodes[b])) > tol:
                 new_edges.append((a, b))
-
     return deduplicate_segments([(np.asarray(new_nodes[i]), np.asarray(new_nodes[j])) for i, j in new_edges], tol=1e-6, min_len=0.0)
 
 
@@ -287,7 +271,6 @@ def collect_floor_node_indices(nodes: np.ndarray, z_levels: np.ndarray, tol: flo
 
 def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict[str, np.ndarray]:
     seeds = sample_variable_density_seeds(width, height, params)
-
     border_pts = []
     n_border = 18
     xs = np.linspace(0.0, width, n_border)
@@ -300,7 +283,6 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
 
     vor = Voronoi(all_pts)
     regions, vertices = voronoi_finite_polygons_2d(vor)
-
     segs = []
     for region in regions[: len(seeds)]:
         poly = [vertices[v] for v in region]
@@ -311,18 +293,11 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
         for a, b in zip(clipped, cyc):
             if np.linalg.norm(a - b) > params.min_edge_len * 0.5:
                 segs.append((np.asarray(a), np.asarray(b)))
-
     nodes, edges = deduplicate_segments(segs, tol=1e-5, min_len=params.min_edge_len)
-    nodes, edges = split_edges_at_story_levels(nodes, edges, np.linspace(0.0, height, params.n_stories + 1), tol=1e-6)
-    floor_nodes = collect_floor_node_indices(nodes, np.linspace(0.0, height, params.n_stories + 1), tol=1e-6)
-    return {
-        "seeds": seeds,
-        "face_nodes": nodes,
-        "face_edges": edges,
-        "floor_nodes": floor_nodes,
-        "width": width,
-        "height": height,
-    }
+    z_levels = np.linspace(0.0, height, params.n_stories + 1)
+    nodes, edges = split_edges_at_story_levels(nodes, edges, z_levels, tol=1e-6)
+    floor_nodes = collect_floor_node_indices(nodes, z_levels, tol=1e-6)
+    return {"seeds": seeds, "face_nodes": nodes, "face_edges": edges, "floor_nodes": floor_nodes, "width": width, "height": height}
 
 
 def generate_face_geometry(params: TowerParams) -> Dict[str, object]:
@@ -330,7 +305,96 @@ def generate_face_geometry(params: TowerParams) -> Dict[str, object]:
     return {"params": asdict(params), "face": face}
 
 
-def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "combined", do_eigen: bool = True) -> Dict[str, object]:
+def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, object]:
+    """Costruisce la geometria 3D della torre replicando la facciata 2D sulle 4 facce.
+    Non esegue analisi 3D. Usa la facciata risultante dalla fase 2D.
+    """
+    params = TowerParams(**geometry['params'])
+    face_nodes = np.asarray(geometry['face']['face_nodes'], dtype=float)
+    face_edges = np.asarray(geometry['face']['face_edges'], dtype=int)
+
+    def map_face_point(face_id: int, u: float, z: float) -> np.ndarray:
+        h = params.plan_size / 2.0
+        if face_id == 0:
+            return np.array([-h + u, -h, z])
+        if face_id == 1:
+            return np.array([h, -h + u, z])
+        if face_id == 2:
+            return np.array([h - u, h, z])
+        if face_id == 3:
+            return np.array([-h, h - u, z])
+        raise ValueError('face_id deve stare in [0,1,2,3]')
+
+    node_map = {}
+    tower_nodes = []
+    tower_edges = []
+
+    def add_node(pt: np.ndarray) -> int:
+        key = tuple(int(round(c * 1e6)) for c in pt)
+        if key in node_map:
+            return node_map[key]
+        idx = len(tower_nodes)
+        tower_nodes.append(pt)
+        node_map[key] = idx
+        return idx
+
+    for face_id in range(4):
+        local_to_global = {}
+        for i, p in enumerate(face_nodes):
+            xyz = map_face_point(face_id, float(p[0]), float(p[1]))
+            local_to_global[i] = add_node(xyz)
+        for i, j in face_edges:
+            tower_edges.append(tuple(sorted((local_to_global[int(i)], local_to_global[int(j)]))))
+
+    # nucleo geometrico equivalente
+    hc = params.core_size / 2.0
+    z_levels = np.linspace(0.0, params.total_height, params.n_stories + 1)
+    core_nodes = []
+    core_shells = []
+    core_map = {}
+    corners = [(-hc, -hc), (hc, -hc), (hc, hc), (-hc, hc)]
+    for k, z in enumerate(z_levels):
+        for c_idx, (x, y) in enumerate(corners):
+            core_map[(k, c_idx)] = len(core_nodes)
+            core_nodes.append([x, y, float(z)])
+    for k in range(params.n_stories):
+        for c1, c2 in [(0,1), (1,2), (2,3), (3,0)]:
+            core_shells.append([
+                core_map[(k, c1)], core_map[(k, c2)],
+                core_map[(k+1, c2)], core_map[(k+1, c1)]
+            ])
+
+    return {
+        'params': geometry['params'],
+        'tower': {
+            'nodes': np.asarray(tower_nodes, dtype=float),
+            'edges': np.asarray(sorted(set(tower_edges)), dtype=int),
+        },
+        'core': {
+            'nodes': np.asarray(core_nodes, dtype=float),
+            'shells': np.asarray(core_shells, dtype=int),
+        }
+    }
+
+
+def _local_axes_from_segment(p1_2d: np.ndarray, p2_2d: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    p1 = np.array([float(p1_2d[0]), float(p1_2d[1]), 0.0], dtype=float)
+    p2 = np.array([float(p2_2d[0]), float(p2_2d[1]), 0.0], dtype=float)
+    vx = p2 - p1
+    L = np.linalg.norm(vx)
+    if L < EPS:
+        raise ValueError('Elemento di lunghezza quasi nulla')
+    vx = vx / L
+    vy = np.array([0.0, 0.0, 1.0], dtype=float)
+    vz = np.cross(vx, vy)
+    nz = np.linalg.norm(vz)
+    if nz < EPS:
+        raise ValueError('Impossibile costruire vz')
+    vz = vz / nz
+    return p1, p2, vx, vz
+
+
+def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'combined', do_eigen: bool = True) -> Dict[str, object]:
     try:
         import openseespy.opensees as ops
     except Exception as exc:
@@ -342,86 +406,74 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "com
     face_edges = np.asarray(face['face_edges'], dtype=int)
     z_levels = np.linspace(0.0, params.total_height, params.n_stories + 1)
     floor_nodes = face.get('floor_nodes') or collect_floor_node_indices(face_nodes, z_levels, tol=1e-6)
-
     exo = shs_properties(params.exo_b, params.exo_t, params.steel_G)
 
     ops.wipe()
-    ops.model('basic', '-ndm', 2, '-ndf', 3)
-    ops.geomTransf('Linear', 1)
+    ops.model('basic', '-ndm', 3, '-ndf', 6)
 
-    # nodi della facciata (x = sviluppo facciata, y = quota)
     for tag, (x, z) in enumerate(face_nodes, start=1):
-        ops.node(tag, float(x), float(z))
+        ops.node(tag, float(x), float(z), 0.0)
 
-    # incastro alla base
     base_node_tags = []
     for tag, (_, z) in enumerate(face_nodes, start=1):
         if abs(float(z)) < 1e-8:
-            ops.fix(tag, 1, 1, 1)
+            ops.fix(tag, 1, 1, 1, 1, 1, 1)
             base_node_tags.append(tag)
 
-    # nodi retained di livello per diaframma 2D
-    master_offset = len(face_nodes) + 1
-    story_master_tags = []
-    for k, z in enumerate(z_levels):
-        mtag = master_offset + k
-        story_master_tags.append(mtag)
-        ops.node(mtag, params.plan_size / 2.0, float(z))
-        if k == 0:
-            ops.fix(mtag, 1, 1, 1)
-        else:
-            # in 2D rigidDiaphragm usa ndf=3 e direzione 1/2; qui si impone la cinematica nel verso X
-            ops.fix(mtag, 0, 1, 0)
-            story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
-            if story_nodes:
-                try:
-                    ops.rigidDiaphragm(1, mtag, *story_nodes)
-                except Exception:
-                    # fallback: se il comando non è accettato nella build locale, si replica il DOF orizzontale
-                    for stag in story_nodes:
-                        try:
-                            ops.equalDOF(mtag, stag, 1)
-                        except Exception:
-                            pass
-
-    # elementi beam-column 2D
     ele_pairs = []
     ele_lengths = []
+    elem_local_axes = []
     ele_tag = 1
+    transf_tag = 1
     for i, j in face_edges:
         ni = int(i) + 1
         nj = int(j) + 1
-        xi, zi = face_nodes[int(i)]
-        xj, zj = face_nodes[int(j)]
-        L = math.dist((xi, zi), (xj, zj))
+        p1_2d = face_nodes[int(i)]
+        p2_2d = face_nodes[int(j)]
+        try:
+            p1_3d, p2_3d, vx, vecxz = _local_axes_from_segment(p1_2d, p2_2d)
+        except Exception:
+            continue
+        L = float(np.linalg.norm(p2_3d - p1_3d))
         if L < params.min_edge_len * 0.5:
             continue
-        ops.element('elasticBeamColumn', ele_tag, ni, nj, exo['A'], params.steel_E, exo['Iz'], 1, '-mass', exo['A'] * params.steel_rho)
+        ops.geomTransf('Linear', transf_tag, float(vecxz[0]), float(vecxz[1]), float(vecxz[2]))
+        ops.element('elasticBeamColumn', ele_tag, ni, nj, exo['A'], params.steel_E, params.steel_G, exo['J'], exo['Iy'], exo['Iz'], transf_tag, '-mass', exo['A'] * params.steel_rho)
         ele_pairs.append((ni, nj))
         ele_lengths.append(L)
+        elem_local_axes.append({'vx': vx.tolist(), 'vy': [0.0, 0.0, 1.0], 'vz': vecxz.tolist()})
         ele_tag += 1
+        transf_tag += 1
 
-    # masse sui retained nodes
     floor_area_face = max((params.plan_size ** 2 - params.core_size ** 2) / 4.0, 1.0)
     g_floor = params.floor_dead_kN_m2 * 1e3 * floor_area_face
     q_floor = params.floor_live_kN_m2 * 1e3 * floor_area_face
     floor_mass = (g_floor + 0.3 * q_floor) / 9.81
     wind_story_face = 0.5 * params.wind_line_kN_m * 1e3 * params.story_height
-    for k in range(1, len(z_levels)):
-        ops.mass(story_master_tags[k], floor_mass, 1e-9, 1e-9)
 
-    # carichi: orizzontali sui retained nodes; verticali distribuiti ai nodi del livello
+    for k in range(1, len(z_levels)):
+        story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
+        if not story_nodes:
+            continue
+        mx = floor_mass / len(story_nodes)
+        my = mx if params.include_vertical_mass else 1e-9
+        for tag in story_nodes:
+            ops.mass(tag, mx, my, 1e-9, 1e-9, 1e-9, 1e-9)
+
     ops.timeSeries('Linear', 1)
     ops.pattern('Plain', 1, 1)
     for k in range(1, len(z_levels)):
+        story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
+        if not story_nodes:
+            continue
         if load_case in ('lateral', 'combined'):
-            ops.load(story_master_tags[k], wind_story_face, 0.0, 0.0)
+            px = wind_story_face / len(story_nodes)
+            for tag in story_nodes:
+                ops.load(tag, px, 0.0, 0.0, 0.0, 0.0, 0.0)
         if load_case in ('gravity', 'combined'):
-            story_nodes = [int(i) + 1 for i in floor_nodes.get(k, [])]
-            if story_nodes:
-                pnode = -g_floor / len(story_nodes)
-                for tag in story_nodes:
-                    ops.load(tag, 0.0, pnode, 0.0)
+            py = -g_floor / len(story_nodes)
+            for tag in story_nodes:
+                ops.load(tag, 0.0, py, 0.0, 0.0, 0.0, 0.0)
 
     ops.constraints('Transformation')
     ops.numberer('RCM')
@@ -432,7 +484,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "com
     ops.analysis('Static')
     ok = ops.analyze(1)
 
-    node_disp = np.zeros((len(face_nodes), 3), dtype=float)
+    node_disp = np.zeros((len(face_nodes), 6), dtype=float)
     for i in range(len(face_nodes)):
         try:
             node_disp[i, :] = np.asarray(ops.nodeDisp(i + 1), dtype=float)
@@ -441,16 +493,18 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "com
 
     elem_forces = []
     elem_quantities = []
-    for etag, _ in enumerate(ele_pairs, start=1):
+    for etag in range(1, len(ele_pairs) + 1):
         try:
-            # CORREZIONE: query corretta per elasticBeamColumn = 'force'
             f = np.asarray(ops.eleResponse(etag, 'force'), dtype=float)
         except Exception:
-            f = np.zeros(6, dtype=float)
+            f = np.zeros(12, dtype=float)
         elem_forces.append(f)
-        N = max(abs(float(f[0])), abs(float(f[3]))) if len(f) >= 6 else 0.0
-        V = max(abs(float(f[1])), abs(float(f[4]))) if len(f) >= 6 else 0.0
-        M = max(abs(float(f[2])), abs(float(f[5]))) if len(f) >= 6 else 0.0
+        if len(f) >= 12:
+            N = max(abs(float(f[0])), abs(float(f[6])))
+            V = max(abs(float(f[1])), abs(float(f[7])))
+            M = max(abs(float(f[5])), abs(float(f[11])))
+        else:
+            N = V = M = 0.0
         elem_quantities.append({'N': N, 'V': V, 'M': M})
 
     eig_vals = []
@@ -466,14 +520,12 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "com
     ux = node_disp[:, 0]
     uz = node_disp[:, 1]
     umag = np.sqrt(ux ** 2 + uz ** 2)
-
     return {
         'analysis_ok': int(ok) == 0,
         'load_case': load_case,
         'nodes': face_nodes,
         'edges': np.asarray(ele_pairs, dtype=int) - 1,
         'base_node_tags': base_node_tags,
-        'story_master_tags': story_master_tags,
         'node_disp': node_disp,
         'ux': ux,
         'uz': uz,
@@ -481,6 +533,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = "com
         'elem_forces': elem_forces,
         'elem_quantities': elem_quantities,
         'elem_lengths': ele_lengths,
+        'elem_local_axes': elem_local_axes,
         'eigenvalues': eig_vals,
         'periods_s': periods,
         'top_ux': float(np.nanmax(np.abs(ux))) if len(ux) else 0.0,
@@ -516,18 +569,46 @@ def plotly_face_traces(face: Dict[str, np.ndarray]):
     nodes = face['face_nodes']
     edges = face['face_edges']
     seeds = face['seeds']
-
     x_lines, z_lines = [], []
     for i, j in edges:
         p1 = nodes[int(i)]
         p2 = nodes[int(j)]
         x_lines += [p1[0], p2[0], None]
         z_lines += [p1[1], p2[1], None]
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_lines, y=z_lines, mode='lines', name='Maglia Voronoi', line=dict(color='#1f77b4', width=1.3)))
     fig.add_trace(go.Scatter(x=seeds[:, 0], y=seeds[:, 1], mode='markers', name='Seed', marker=dict(size=3, color='#d62728')))
     fig.update_layout(title='Facciata Voronoi 2D', xaxis_title='Sviluppo facciata [m]', yaxis_title='Quota z [m]', yaxis_scaleanchor='x', template='plotly_white', height=650)
+    return fig
+
+
+def plotly_tower_traces(tower_geometry: Dict[str, object]):
+    import plotly.graph_objects as go
+    tower_nodes = tower_geometry['tower']['nodes']
+    tower_edges = tower_geometry['tower']['edges']
+    core_nodes = tower_geometry['core']['nodes']
+    core_shells = tower_geometry['core']['shells']
+
+    x_lines, y_lines, z_lines = [], [], []
+    for i, j in tower_edges:
+        p1 = tower_nodes[int(i)]
+        p2 = tower_nodes[int(j)]
+        x_lines += [p1[0], p2[0], None]
+        y_lines += [p1[1], p2[1], None]
+        z_lines += [p1[2], p2[2], None]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(x=x_lines, y=y_lines, z=z_lines, mode='lines', name='Esoscheletro 3D', line=dict(color='#0a84ff', width=3)))
+
+    cx, cy, cz = [], [], []
+    for n1, n2, n3, n4 in core_shells:
+        pts = [core_nodes[int(n)] for n in [n1, n2, n3, n4, n1]]
+        for a, b in zip(pts[:-1], pts[1:]):
+            cx += [a[0], b[0], None]
+            cy += [a[1], b[1], None]
+            cz += [a[2], b[2], None]
+    fig.add_trace(go.Scatter3d(x=cx, y=cy, z=cz, mode='lines', name='Nucleo 3D', line=dict(color='#ff7f0e', width=4)))
+    fig.update_layout(title='Costruzione 3D dalla facciata 2D', scene=dict(xaxis_title='X [m]', yaxis_title='Y [m]', zaxis_title='Z [m]', aspectmode='data'), template='plotly_white', height=820)
     return fig
 
 
@@ -539,7 +620,6 @@ def plotly_face_deformed_shape(face_result: Dict[str, object], scale: float = 25
     deformed = nodes + np.column_stack([node_disp[:, 0] * scale, node_disp[:, 1] * scale])
     umag = np.asarray(face_result['umag'], dtype=float)
     vmin, vmax = _safe_min_max(umag)
-
     fig = go.Figure()
     xu, zu = [], []
     for i, j in edges:
@@ -548,7 +628,6 @@ def plotly_face_deformed_shape(face_result: Dict[str, object], scale: float = 25
         xu += [p1[0], p2[0], None]
         zu += [p1[1], p2[1], None]
     fig.add_trace(go.Scatter(x=xu, y=zu, mode='lines', name='Indeformata', line=dict(color='rgba(120,120,120,0.45)', width=1)))
-
     xd, zd = [], []
     for i, j in edges:
         p1 = deformed[int(i)]
@@ -556,14 +635,7 @@ def plotly_face_deformed_shape(face_result: Dict[str, object], scale: float = 25
         xd += [p1[0], p2[0], None]
         zd += [p1[1], p2[1], None]
     fig.add_trace(go.Scatter(x=xd, y=zd, mode='lines', name=f'Deformata x{scale:g}', line=dict(color='crimson', width=1.8)))
-
-    fig.add_trace(go.Scatter(
-        x=deformed[:, 0], y=deformed[:, 1], mode='markers', name='|u| nodi deformati',
-        marker=dict(size=5, color=umag, colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title='|u| [m]')),
-        customdata=np.column_stack([node_disp[:, 0], node_disp[:, 1], umag]),
-        hovertemplate='x=%{x:.2f} m<br>z=%{y:.2f} m<br>ux=%{customdata[0]:.4e} m<br>uz=%{customdata[1]:.4e} m<br>|u|=%{customdata[2]:.4e} m<extra></extra>'
-    ))
-
+    fig.add_trace(go.Scatter(x=deformed[:, 0], y=deformed[:, 1], mode='markers', name='|u| nodi deformati', marker=dict(size=5, color=umag, colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title='|u| [m]')), customdata=np.column_stack([node_disp[:, 0], node_disp[:, 1], umag]), hovertemplate='x=%{x:.2f} m<br>z=%{y:.2f} m<br>ux=%{customdata[0]:.4e} m<br>uz=%{customdata[1]:.4e} m<br>|u|=%{customdata[2]:.4e} m<extra></extra>'))
     fig.update_layout(title='Facciata 2D – mesh indeformata/deformata', xaxis_title='Sviluppo facciata [m]', yaxis_title='Quota z [m]', yaxis_scaleanchor='x', template='plotly_white', height=760, legend=dict(orientation='h', y=1.02))
     return fig
 
@@ -576,19 +648,11 @@ def plotly_face_force_map(face_result: Dict[str, object], quantity: str = 'M', d
     mesh = nodes + np.column_stack([node_disp[:, 0] * scale, node_disp[:, 1] * scale]) if deformed else nodes
     vals = np.asarray([float(q.get(quantity, 0.0)) for q in face_result['elem_quantities']], dtype=float)
     colors, vmin, vmax = _sample_colors('Turbo', vals)
-
     fig = go.Figure()
     for eidx, (i, j) in enumerate(edges):
         p1 = mesh[int(i)]
         p2 = mesh[int(j)]
-        fig.add_trace(go.Scatter(
-            x=[p1[0], p2[0]], y=[p1[1], p2[1]], mode='lines',
-            line=dict(color=colors[eidx], width=2.5),
-            showlegend=False,
-            customdata=[[vals[eidx], int(i), int(j)], [vals[eidx], int(i), int(j)]],
-            hovertemplate=(f'{quantity}=' + '%{customdata[0]:.4e}<br>' + 'i=%{customdata[1]} j=%{customdata[2]}<extra></extra>')
-        ))
-
+        fig.add_trace(go.Scatter(x=[p1[0], p2[0]], y=[p1[1], p2[1]], mode='lines', line=dict(color=colors[eidx], width=2.5), showlegend=False, customdata=[[vals[eidx], int(i), int(j)], [vals[eidx], int(i), int(j)]], hovertemplate=(f'{quantity}=' + '%{customdata[0]:.4e}<br>' + 'i=%{customdata[1]} j=%{customdata[2]}<extra></extra>')))
     mid = mesh.mean(axis=0)
     fig.add_trace(go.Scatter(x=[mid[0]], y=[mid[1]], mode='markers', showlegend=False, marker=dict(size=0.1, color=[vmin, vmax], colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title=quantity)), hoverinfo='skip'))
     suffix = 'deformata' if deformed else 'indeformata'
@@ -604,14 +668,12 @@ def plotly_face_displacement_map(face_result: Dict[str, object], component: str 
         component = 'ux'
     vals = np.asarray(face_result[component], dtype=float)
     vmin, vmax = _safe_min_max(vals)
-
     x_lines, z_lines = [], []
     for i, j in edges:
         p1 = nodes[int(i)]
         p2 = nodes[int(j)]
         x_lines += [p1[0], p2[0], None]
         z_lines += [p1[1], p2[1], None]
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_lines, y=z_lines, mode='lines', name='Mesh', line=dict(color='rgba(90,90,90,0.30)', width=1.2)))
     fig.add_trace(go.Scatter(x=nodes[:, 0], y=nodes[:, 1], mode='markers', name=component, marker=dict(size=6, color=vals, colorscale='Turbo', cmin=vmin, cmax=vmax, colorbar=dict(title=component)), customdata=np.column_stack([face_result['ux'], face_result['uz'], face_result['umag']]), hovertemplate='x=%{x:.2f} m<br>z=%{y:.2f} m<br>ux=%{customdata[0]:.4e} m<br>uz=%{customdata[1]:.4e} m<br>|u|=%{customdata[2]:.4e} m<extra></extra>'))

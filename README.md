@@ -1,12 +1,17 @@
 
-# Vorogrid Face 2D + OpenSees
+# Vorogrid 2D -> 3D
 
-Versione corretta dell'applicativo focalizzata SOLO sulla facciata 2D.
+In questa fase il progetto si concentra su:
+1. analisi FEM della facciata 2D;
+2. costruzione del 3D a partire dalla facciata 2D;
+3. nessuna analisi FEM 3D.
 
-## Correzioni principali
-- `rigidDiaphragm(1, retained, *nodes)` nel modello 2D della facciata;
-- query corretta delle forze degli `elasticBeamColumn`: `eleResponse(..., 'force')`;
-- nessun run del modello 3D dalla UI: l'app esegue solo la facciata 2D.
+## Nota tecnica
+La facciata viene analizzata con beam 3D planari per poter assegnare i versori locali di ogni asta:
+- `vx` lungo la trave
+- `vy = (0,0,1)`
+- `vz = vx x vy`
+- `geomTransf('Linear', transfTag, *vz)`
 
 ## Avvio
 ```bash
