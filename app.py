@@ -173,7 +173,9 @@ if prune:
         f"Pulizia topologica: componenti trovati={prune.get('components_total',0)}, "
         f"tenuti={prune.get('components_kept',0)}, "
         f"nodi rimossi={prune.get('nodes_removed',0)}, "
-        f"aste rimosse={prune.get('edges_removed',0)}."
+        f"aste rimosse={prune.get('edges_removed',0)}. "
+        f"Nodi pendenti rimossi={prune.get('dangling_nodes_removed',0)}, "
+        f"aste pendenti rimosse={prune.get('dangling_edges_removed',0)}."
     )
 
 # ── Tab ───────────────────────────────────────────────────────────────────────
