@@ -175,7 +175,12 @@ if prune:
         f"nodi rimossi={prune.get('nodes_removed',0)}, "
         f"aste rimosse={prune.get('edges_removed',0)}. "
         f"Nodi pendenti rimossi={prune.get('dangling_nodes_removed',0)}, "
-        f"aste pendenti rimosse={prune.get('dangling_edges_removed',0)}."
+        f"aste pendenti rimosse={prune.get('dangling_edges_removed',0)}. "
+        f"Componenti prima cucitura={prune.get('components_before_connect',0)}, "
+        f"ponti aggiunti={prune.get('bridges_added',0)}, "
+        f"ponti dopo cleanup={prune.get('bridges_added_after_cleanup',0)}, "
+        f"componenti finali={prune.get('components_after_cleanup',0)}, "
+        f"segmenti perimetrali aggiunti={prune.get('perimeter_segments_added',0)}."
     )
 
 # ── Tab ───────────────────────────────────────────────────────────────────────
@@ -218,12 +223,11 @@ with tab2:
                   delta=f"{'OK' if top_ux <= h_lim else 'SUPERA'}",
                   delta_color="normal" if top_ux <= h_lim else "inverse")
 
-        diaphragm_info = "diaframma rigido ai piani (equalDOF UX)" if use_floor_diaphragm else "SENZA diaframma di piano"
         st.caption(
             f"Modello 2D: {face_analysis.get('n_active_nodes', '?')} nodi attivi "
             f"({len(face_analysis.get('base_node_tags',[]))} incastrati alla base) · "
             f"{face_analysis.get('n_active_elements', '?')} elementi · "
-            f"{diaphragm_info}."
+            f"senza diaframma rigido di piano; risposta governata dalla connettività reale della mesh."
         )
 
         copt1, copt2, copt3 = st.columns(3)

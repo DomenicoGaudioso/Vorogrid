@@ -398,6 +398,146 @@ def prune_face_graph_to_base(nodes: np.ndarray, edges: np.ndarray, z_levels: np.
     return new_nodes, new_edges, stats
 
 
+def _connected_components_from_edges(n_nodes: int, edges: np.ndarray) -> List[set[int]]:
+    """Restituisce tutti i componenti connessi del grafo nodi/aste."""
+    if n_nodes <= 0:
+        return []
+
+    adj: Dict[int, set[int]] = defaultdict(set)
+    touched: set[int] = set()
+    for raw_i, raw_j in np.asarray(edges, dtype=int):
+        i = int(raw_i)
+        j = int(raw_j)
+        if i == j:
+            continue
+        adj[i].add(j)
+        adj[j].add(i)
+        touched.add(i)
+        touched.add(j)
+
+    components: List[set[int]] = []
+    visited: set[int] = set()
+    for start in range(n_nodes):
+        if start in visited:
+            continue
+        visited.add(start)
+        if start not in touched:
+            components.append({start})
+            continue
+        q = deque([start])
+        comp = {start}
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in visited:
+                    visited.add(v)
+                    comp.add(v)
+                    q.append(v)
+        components.append(comp)
+    return components
+
+
+def _is_perimeter_node(pt: np.ndarray, width: float, height: float, tol: float = 1e-6) -> bool:
+    x = float(pt[0]); z = float(pt[1])
+    return (
+        abs(x - 0.0) <= tol or
+        abs(x - width) <= tol or
+        abs(z - 0.0) <= tol or
+        abs(z - height) <= tol
+    )
+
+
+def build_perimeter_segments(width: float, height: float, z_levels: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Costruisce il telaio perimetrale 2D della facciata:
+    - montante sinistro x=0, spezzato a ogni livello di piano
+    - montante destro x=width, spezzato a ogni livello di piano
+    - trave di base z=0
+    - trave di coronamento z=height
+    """
+    zvals = sorted({0.0, float(height), *[float(z) for z in np.asarray(z_levels, dtype=float)]})
+    segments: List[Tuple[np.ndarray, np.ndarray]] = []
+
+    for z1, z2 in zip(zvals[:-1], zvals[1:]):
+        if abs(z2 - z1) <= EPS:
+            continue
+        segments.append((np.array([0.0, z1], dtype=float), np.array([0.0, z2], dtype=float)))
+        segments.append((np.array([width, z1], dtype=float), np.array([width, z2], dtype=float)))
+
+    segments.append((np.array([0.0, 0.0], dtype=float), np.array([width, 0.0], dtype=float)))
+    segments.append((np.array([0.0, height], dtype=float), np.array([width, height], dtype=float)))
+    return segments
+
+
+def connect_face_components(nodes: np.ndarray, edges: np.ndarray, z_levels: np.ndarray, width: float, height: float, tol: float = 1e-6):
+    """
+    Rende la mesh un unico grafo connesso aggiungendo il numero minimo di
+    aste-ponte (una per ogni componente secondario).
+
+    Strategia di scelta della coppia di nodi da collegare:
+    1. preferenza a nodi sullo stesso interpiano;
+    2. preferenza a nodi di bordo/perimetro;
+    3. fallback sulla distanza euclidea minima.
+    """
+    nodes = np.asarray(nodes, dtype=float)
+    edges = np.asarray(edges, dtype=int)
+
+    comps = _connected_components_from_edges(len(nodes), edges)
+    comps_nonempty = [c for c in comps if c]
+    before = len(comps_nonempty)
+    if before <= 1:
+        return nodes, edges, {
+            'components_before_connect': int(before),
+            'components_after_connect': int(before),
+            'bridges_added': 0,
+        }
+
+    base_z = float(z_levels[0]) if len(z_levels) else 0.0
+    base_nodes = {i for i, p in enumerate(nodes) if abs(float(p[1]) - base_z) <= tol}
+
+    def comp_score(comp: set[int]):
+        return (len(comp & base_nodes), len(comp))
+
+    anchor = set(max(comps_nonempty, key=comp_score))
+    remaining = [set(c) for c in comps_nonempty if c is not anchor and c != anchor]
+
+    edge_set = {tuple(sorted((int(i), int(j)))) for i, j in edges if int(i) != int(j)}
+    bridges_added = 0
+
+    def node_priority(i: int, j: int):
+        pi = nodes[i]
+        pj = nodes[j]
+        same_level = int(any(abs(float(pi[1]) - float(z)) <= tol and abs(float(pj[1]) - float(z)) <= tol for z in z_levels))
+        on_perimeter = int(_is_perimeter_node(pi, width, height, tol) or _is_perimeter_node(pj, width, height, tol))
+        dist2 = float(np.sum((pi - pj) ** 2))
+        return (-same_level, -on_perimeter, dist2, i, j)
+
+    while remaining:
+        best = None
+        best_idx = None
+        anchor_ids = sorted(anchor)
+        for ridx, comp in enumerate(remaining):
+            comp_ids = sorted(comp)
+            for i in anchor_ids:
+                for j in comp_ids:
+                    cand = node_priority(i, j)
+                    if best is None or cand < best:
+                        best = cand
+                        best_idx = ridx
+        _, _, _, ni, nj = best
+        edge_set.add(tuple(sorted((int(ni), int(nj)))))
+        bridges_added += 1
+        anchor |= remaining.pop(best_idx)
+
+    new_edges = np.asarray(sorted(edge_set), dtype=int) if edge_set else np.zeros((0, 2), dtype=int)
+    after = len(_connected_components_from_edges(len(nodes), new_edges))
+    return nodes, new_edges, {
+        'components_before_connect': int(before),
+        'components_after_connect': int(after),
+        'bridges_added': int(bridges_added),
+    }
+
+
 def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict[str, np.ndarray]:
     seeds = sample_variable_density_seeds(width, height, params)
     border_pts = []
@@ -412,7 +552,8 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
 
     vor = Voronoi(all_pts)
     regions, vertices = voronoi_finite_polygons_2d(vor)
-    segs = []
+
+    voronoi_segments: List[Tuple[np.ndarray, np.ndarray]] = []
     for region in regions[: len(seeds)]:
         poly = [vertices[v] for v in region]
         clipped = rectangle_clip_polygon(poly, 0.0, width, 0.0, height)
@@ -421,12 +562,20 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
         cyc = clipped[1:] + clipped[:1]
         for a, b in zip(clipped, cyc):
             if np.linalg.norm(a - b) > params.min_edge_len * 0.5:
-                segs.append((np.asarray(a), np.asarray(b)))
-    nodes, edges = deduplicate_segments(segs, tol=1e-5, min_len=params.min_edge_len)
+                voronoi_segments.append((np.asarray(a, dtype=float), np.asarray(b, dtype=float)))
+
     z_levels = np.linspace(0.0, height, params.n_stories + 1)
+    perimeter_segments = build_perimeter_segments(width, height, z_levels)
+    all_segments = voronoi_segments + perimeter_segments
+
+    nodes, edges = deduplicate_segments(all_segments, tol=1e-5, min_len=params.min_edge_len)
     nodes, edges = split_edges_at_story_levels(nodes, edges, z_levels, tol=1e-6)
+
+    nodes, edges, connect_stats_pre = connect_face_components(nodes, edges, z_levels, width, height, tol=1e-6)
     nodes, edges, prune_stats = prune_face_graph_to_base(nodes, edges, z_levels, tol=1e-6)
     nodes, edges, dangling_stats = remove_dangling_nodes(nodes, edges, z_levels, tol=1e-6)
+    nodes, edges, connect_stats_post = connect_face_components(nodes, edges, z_levels, width, height, tol=1e-6)
+
     floor_nodes = collect_floor_node_indices(nodes, z_levels, tol=1e-6)
     return {
         "seeds": seeds,
@@ -435,7 +584,14 @@ def build_face_voronoi(width: float, height: float, params: TowerParams) -> Dict
         "floor_nodes": floor_nodes,
         "width": width,
         "height": height,
-        "prune_stats": {**prune_stats, **dangling_stats},
+        "prune_stats": {
+            **prune_stats,
+            **dangling_stats,
+            **connect_stats_pre,
+            "bridges_added_after_cleanup": int(connect_stats_post.get('bridges_added', 0)),
+            "components_after_cleanup": int(connect_stats_post.get('components_after_connect', 0)),
+            "perimeter_segments_added": int(len(perimeter_segments)),
+        },
     }
 
 
@@ -505,12 +661,15 @@ def build_tower_geometry_from_face(geometry: Dict[str, object]) -> Dict[str, obj
 def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'combined', do_eigen: bool = True) -> Dict[str, object]:
     """Modello 2D planare (ndm=2, ndf=3: UX, UY, RZ).
 
-    Strategia anti-singolarità a tre livelli:
+    Il modello lavora esclusivamente sulla connettività reale della mesh 2D:
+    nessun diaframma rigido di piano (equalDOF).
+
+    Strategia anti-singolarità:
     1. Pre-filtraggio degli elementi per lunghezza minima.
     2. Ri-pruning BFS: si tengono solo i nodi raggiungibili dalla base
-       attraverso gli elementi filtrati (evita sottocomponenti flottanti).
+       attraverso gli elementi filtrati.
     3. Solo i nodi che compaiono in almeno un elemento valido vengono
-       inseriti nel modello OpenSees (evita DOF orfani).
+       inseriti nel modello OpenSees.
     """
     try:
         import openseespy.opensees as ops
@@ -527,7 +686,7 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
 
     # ── 1. Pre-filtraggio per lunghezza ─────────────────────────────────────
     L_min = params.min_edge_len * 0.5
-    candidate: List[Tuple[int, int, float]] = []  # (face_i, face_j, L)
+    candidate: List[Tuple[int, int, float]] = []
     for raw_i, raw_j in face_edges:
         fi, fj = int(raw_i), int(raw_j)
         L = float(np.linalg.norm(face_nodes[fi] - face_nodes[fj]))
@@ -563,21 +722,6 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         used_face.add(fj)
     face_to_ops: Dict[int, int] = {fi: tag for tag, fi in enumerate(sorted(used_face), start=1)}
     ops_to_face: Dict[int, int] = {v: k for k, v in face_to_ops.items()}
-
-    # ── Diaframma rigido 2D (equalDOF in UX) ────────────────────────────────
-    # Collega tutti i nodi allo stesso livello di piano con lo stesso UX
-    # (simula il solaio rigido nel piano, impedisce che catene Voronoi
-    # non collegate si deformino indipendentemente).
-    diaphragm_masters_2d: Dict[int, int] = {}  # k → ops_tag del nodo master
-    if params.use_floor_diaphragm:
-        for k in range(1, len(z_levels)):
-            sn = [face_to_ops[int(i)] for i in floor_nodes.get(k, []) if int(i) in face_to_ops]
-            if len(sn) < 2:
-                continue
-            master_tag = sn[0]
-            diaphragm_masters_2d[k] = master_tag
-            for slave_tag in sn[1:]:
-                ops.equalDOF(master_tag, slave_tag, 1)  # DOF 1 = UX
 
     floor_area_face = max((params.plan_size ** 2 - params.core_size ** 2) / 4.0, 1.0)
     g_floor = params.floor_dead_kN_m2 * 1e3 * floor_area_face
@@ -635,18 +779,13 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
         if not sn:
             continue
         if load_case in ('lateral', 'combined'):
-            # Con diaframma: tutto il carico laterale al nodo master
-            # Senza diaframma: distribuito a tutti i nodi del piano
-            if params.use_floor_diaphragm and k in diaphragm_masters_2d:
-                ops.load(diaphragm_masters_2d[k], float(wind_story_face), 0.0, 0.0)
-            else:
-                px = wind_story_face / len(sn)
-                for tag in sn:
-                    ops.load(tag, px, 0.0, 0.0)
+            px = wind_story_face / len(sn)
+            for tag in sn:
+                ops.load(tag, float(px), 0.0, 0.0)
         if load_case in ('gravity', 'combined'):
             py = -g_floor / len(sn)
             for tag in sn:
-                ops.load(tag, 0.0, py, 0.0)
+                ops.load(tag, 0.0, float(py), 0.0)
 
     # ── Analisi statica ──────────────────────────────────────────────────────
     ops.constraints('Transformation')
@@ -713,7 +852,6 @@ def build_opensees_face_model(geometry: Dict[str, object], load_case: str = 'com
                 drift_ratios.append(d / h)
     max_drift = float(max(drift_ratios)) if drift_ratios else 0.0
 
-    # Converti ele_pairs da ops-tag a face-idx (0-based) per il plotting
     result_edges = np.array(
         [(ops_to_face[ni], ops_to_face[nj]) for ni, nj in ele_pairs_ops], dtype=int
     )
