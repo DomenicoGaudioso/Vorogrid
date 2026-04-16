@@ -1,21 +1,42 @@
-MIT License
+END USER LICENSE AGREEMENT (EULA) AND PROPRIETARY SOFTWARE LICENSE
 
 Copyright (c) 2026 Domenico Gaudioso
+All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+IMPORTANT LEGAL NOTICE TO ALL USERS: CAREFULLY READ THE FOLLOWING LEGAL AGREEMENT. THIS IS A PROPRIETARY SOFTWARE LICENSE, NOT AN OPEN-SOURCE LICENSE. 
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. DEFINITIONS
+1.1 "Software" refers to all source code, scripts, binaries, architectural layouts, algorithms, documentation, and digital assets contained within this repository, excluding explicitly marked Third-Party Components.
+1.2 "Author" and "Licensor" refer exclusively to Domenico Gaudioso.
+1.3 "User" or "You" refers to any individual, corporation, or legal entity accessing, viewing, or downloading the Software.
+1.4 "Third-Party Components" refers to independent, open-source libraries or modules imported or utilized by the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. OWNERSHIP AND INTELLECTUAL PROPERTY
+2.1 The Software is the exclusive intellectual property of the Author and is protected by international copyright laws, trade secret laws, and other intellectual property treaties. 
+2.2 The public visibility of this source code on GitHub (or any other hosting platform) is strictly for archival, portfolio, or read-only purposes. It DOES NOT constitute a waiver of the Author's intellectual property rights, nor does it place the Software into the public domain.
+
+3. VALUE OF LABOR AND OPEN-SOURCE INTEGRATION
+3.1 The Author acknowledges that the Software may interface with, import, or bundle certain permissive Third-Party Components (e.g., MIT, Apache 2.0).
+3.2 Any commercial fees, licensing costs, or monetary compensation requested for this Software are STRICTLY and EXCLUSIVELY charged for the Author's proprietary logic, architectural design, system integration, adaptation, and the professional labor required to develop the custom codebase.
+3.3 The Author explicitly does not claim ownership of, nor charge licensing fees for, the underlying Third-Party Components, which remain the property of their respective original creators and are governed by their own permissive licenses.
+
+4. RESTRICTIONS ON USE (PROHIBITED ACTIONS)
+Unless expressly authorized by a separate, mutually executed Commercial License Agreement signed by the Author, You are STRICTLY PROHIBITED from:
+4.1 Copying, reproducing, or duplicating the Software, in whole or in part.
+4.2 Modifying, translating, adapting, or creating derivative works based on the Software's proprietary logic.
+4.3 Distributing, sublicensing, leasing, renting, selling, or commercializing the Software.
+4.4 Reverse engineering, decompiling, or disassembling any compiled portions of the Software.
+4.5 Removing, altering, or obscuring any copyright, trademark, or proprietary rights notices contained within the Software.
+
+5. DISCLAIMER OF WARRANTIES
+THE SOFTWARE IS PROVIDED ON AN "AS IS" AND "AS AVAILABLE" BASIS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE AUTHOR EXPRESSLY DISCLAIMS ALL WARRANTIES, INCLUDING BUT NOT LIMITED TO, IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. THE AUTHOR DOES NOT WARRANT THAT THE SOFTWARE WILL BE UNINTERRUPTED, ERROR-FREE, SECURE, OR COMPLETELY FREE OF VULNERABILITIES.
+
+6. LIMITATION OF LIABILITY AND INDEMNIFICATION
+6.1 IN NO EVENT SHALL THE AUTHOR BE LIABLE TO YOU OR ANY THIRD PARTY FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, PUNITIVE, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, REVENUE, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF, OR INABILITY TO USE, THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+6.2 The User assumes full and sole responsibility for any consequences resulting from the deployment, execution, or utilization of the Software.
+
+7. GOVERNING LAW AND SEVERABILITY
+7.1 If any provision of this Agreement is held to be unenforceable or invalid, such provision shall be changed and interpreted to accomplish the objectives of such provision to the greatest extent possible under applicable law, and the remaining provisions shall continue in full force and effect.
+7.2 Any unauthorized use of this Software will result in immediate legal action to seek injunctive relief and financial damages.
+
+BY ACCESSING OR VIEWING THIS REPOSITORY, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS AGREEMENT, UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS STRICT PROPRIETARY TERMS.
